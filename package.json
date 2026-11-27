@@ -1,0 +1,46 @@
+{
+  "name": "recall-academy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "db:generate": "drizzle-kit generate",
+    "start": "wrangler dev --config wrangler.jsonc --local",
+    "db:migrate": "wrangler d1 migrations apply DB --local --config wrangler.jsonc",
+    "test:worker": "node scripts/worker-smoke.mjs"
+  },
+  "dependencies": {
+    "drizzle-orm": "latest",
+    "katex": "latest",
+    "lucide-react": "latest",
+    "mathjs": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "recharts": "latest",
+    "ts-fsrs": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "latest",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.11",
+    "@types/katex": "latest",
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "@vitejs/plugin-react": "latest",
+    "drizzle-kit": "latest",
+    "esbuild": "latest",
+    "happy-dom": "^21.0.4",
+    "miniflare": "^5.20261110.1-beta",
+    "prettier": "^3.10.1",
+    "typescript": "latest",
+    "vite": "latest",
+    "vitest": "latest",
+    "wrangler": "latest"
+  }
+}

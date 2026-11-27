@@ -1,0 +1,12 @@
+node_modules/
+.local/
+dist/
+.wrangler/
+.sites-runtime/
+.dev.vars*
+.env*
+!.env.example
+outputs/
+coverage/
+*.tsbuildinfo
+worker/assets.generated.ts

@@ -1,0 +1,8 @@
+{
+  "name": "recall-academy",
+  "main": "dist/server/index.js",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [{"binding":"DB","database_name":"recall-academy","database_id":"00000000-0000-0000-0000-000000000000","migrations_dir":"drizzle"}],
+  "r2_buckets": [{"binding":"BUCKET","bucket_name":"recall-academy-assets"}]
+}
