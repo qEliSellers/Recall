@@ -60,6 +60,7 @@ export const cards = sqliteTable(
   },
   (t) => [
     uniqueIndex("cards_course_external").on(t.courseId, t.externalId),
+    index("cards_course_position").on(t.courseId, t.position),
     index("cards_unit").on(t.unitId),
   ],
 );
@@ -90,11 +91,15 @@ export const problems = sqliteTable(
     hint: text("hint"),
     solution: text("solution"),
     template: text("template"),
+    position: integer("position").notNull().default(0),
     revision: integer("revision").notNull().default(1),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
   },
-  (t) => [uniqueIndex("problems_course_external").on(t.courseId, t.externalId)],
+  (t) => [
+    uniqueIndex("problems_course_external").on(t.courseId, t.externalId),
+    index("problems_course_position").on(t.courseId, t.position),
+  ],
 );
 export const sessions = sqliteTable(
   "sessions",

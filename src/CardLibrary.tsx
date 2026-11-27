@@ -1,17 +1,14 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect } from "react";
 import {
   Search,
   Plus,
   Upload,
-  Download,
   PenLine,
   ChevronLeft,
   ChevronRight,
   Pause,
   Play,
-  FileJson,
   Check,
-  Copy,
   ImagePlus,
   Info,
   Calculator,
@@ -20,6 +17,8 @@ import {
 } from "lucide-react";
 import { api, typeLabel, type Course, type Unit, type CardRow } from "./api";
 import { Modal, Empty, Loading, ErrorNotice } from "./ui";
+import type { ImportResult } from "../lib/import-format";
+import ImportDialog from "./ImportDialog";
 const exampleContent = {
   type: "multiple_choice",
   prompt: "Synthetic example: which number is even?",
@@ -31,34 +30,6 @@ const exampleContent = {
   correctOptionIds: ["a"],
   explanation: "2 is divisible by 2 without a remainder.",
 };
-function csvRows(text: string): string[][] {
-  const rows: string[][] = [];
-  let row: string[] = [],
-    value = "",
-    quoted = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (c === '"') {
-      if (quoted && text[i + 1] === '"') {
-        value += '"';
-        i++;
-      } else quoted = !quoted;
-    } else if (c === "," && !quoted) {
-      row.push(value);
-      value = "";
-    } else if ((c === "\n" || c === "\r") && !quoted) {
-      if (c === "\r" && text[i + 1] === "\n") i++;
-      row.push(value);
-      if (row.some(Boolean)) rows.push(row);
-      row = [];
-      value = "";
-    } else value += c;
-  }
-  if (quoted) throw new Error("CSV contains an unclosed quoted field.");
-  row.push(value);
-  if (row.some(Boolean)) rows.push(row);
-  return rows;
-}
 export default function CardLibrary({
   course,
   units,
@@ -84,6 +55,7 @@ export default function CardLibrary({
     [loading, setLoading] = useState(true),
     [error, setError] = useState(""),
     [importing, setImporting] = useState(false),
+    [importResult, setImportResult] = useState<ImportResult | null>(null),
     [editing, setEditing] = useState<CardRow | null | undefined>(undefined),
     [localRevision, setLocalRevision] = useState(0),
     [busy, setBusy] = useState(false);
@@ -100,7 +72,7 @@ export default function CardLibrary({
         api(`${prefix}.list`, {
           courseId: course.id,
           unitId: unitId || undefined,
-          status: status || undefined,
+          status: mode === "card" ? status || undefined : undefined,
           type: type || undefined,
           skill: skill || undefined,
           search: search || undefined,
@@ -417,14 +389,14 @@ export default function CardLibrary({
         ) : (
           <Empty
             title={
-              search || status || unitId || type || skill
+              search || (mode === "card" && status) || unitId || type || skill
                 ? "No matching questions"
                 : mode === "problem"
                   ? "Put understanding into practice"
                   : "A library waiting to grow"
             }
             body={
-              search || status || unitId || type || skill
+              search || (mode === "card" && status) || unitId || type || skill
                 ? "Try adjusting your filters."
                 : mode === "problem"
                   ? "Import your own problems with skill tags, hints, and worked solutions."
@@ -451,14 +423,27 @@ export default function CardLibrary({
           />
         )}
       </section>
+      {importResult && (
+        <div className="success-notice" role="status">
+          <Check size={16} />
+          <span>
+            {importResult.replayed
+              ? "This batch was already imported."
+              : `Added ${importResult.units?.reduce((sum, unit) => sum + unit.cards.imported, 0) ?? 0} cards and ${importResult.units?.reduce((sum, unit) => sum + unit.problems.imported, 0) ?? 0} problems. ${importResult.skipped} existing items skipped.`}
+          </span>
+        </div>
+      )}
       {importing && (
         <ImportDialog
           course={course}
           units={units}
-          mode={mode}
+          kind={prefix}
+          initialUnitId={unitId}
           onClose={() => setImporting(false)}
-          onSaved={() => {
+          onSaved={(result) => {
             setImporting(false);
+            setImportResult(result);
+            setOffset(0);
             changed();
           }}
         />
@@ -477,248 +462,6 @@ export default function CardLibrary({
         />
       )}
     </>
-  );
-}
-function ImportDialog({
-  course,
-  units,
-  mode,
-  onClose,
-  onSaved,
-}: {
-  course: Course;
-  units: Unit[];
-  mode: "card" | "problem";
-  onClose: () => void;
-  onSaved: () => void;
-}) {
-  const [unitId, setUnitId] = useState(units[0]?.id || ""),
-    [format, setFormat] = useState("json"),
-    [text, setText] = useState(""),
-    [batchId] = useState(crypto.randomUUID()),
-    [error, setError] = useState(""),
-    [busy, setBusy] = useState(false),
-    [fileName, setFileName] = useState("");
-  const sample = {
-    cards: [
-      {
-        externalId: "example-001",
-        skills: ["example"],
-        content: exampleContent,
-      },
-    ],
-  };
-  async function submit(e: React.FormEvent) {
-    e.preventDefault();
-    setBusy(true);
-    setError("");
-    try {
-      let entries;
-      if (format === "csv") {
-        const rows = csvRows(text),
-          header = rows.shift()?.map((s) => s.trim().toLowerCase());
-        if (!header) throw new Error("CSV is empty.");
-        entries = rows.map((row, index) => {
-          const r = Object.fromEntries(header.map((h, i) => [h, row[i] || ""]));
-          if (!r.prompt || !r.answer)
-            throw new Error(`Row ${index + 2} needs prompt and answer.`);
-          const choices = [
-            r.option_a,
-            r.option_b,
-            r.option_c,
-            r.option_d,
-          ].filter(Boolean);
-          const correct = choices.findIndex((c) => c === r.answer);
-          if (correct < 0)
-            throw new Error(
-              `Row ${index + 2}: answer must exactly match one option.`,
-            );
-          return {
-            externalId: r.external_id || undefined,
-            skills:
-              r.skills
-                ?.split(";")
-                .map((s) => s.trim())
-                .filter(Boolean) || [],
-            content: {
-              type: "multiple_choice",
-              prompt: r.prompt,
-              options: choices.map((s, i) => ({ id: String(i), text: s })),
-              correctOptionIds: [String(correct)],
-              explanation: r.explanation || undefined,
-            },
-          };
-        });
-      } else {
-        const parsed = JSON.parse(text);
-        entries = Array.isArray(parsed)
-          ? parsed
-          : parsed.cards || parsed.problems;
-        if (!Array.isArray(entries))
-          throw new Error(
-            "Use a JSON array or an object with a cards or problems array.",
-          );
-      }
-      await api(mode === "problem" ? "problems.import" : "cards.import", {
-        courseId: course.id,
-        unitId,
-        batchId,
-        [mode === "problem" ? "problems" : "cards"]: entries,
-      });
-      onSaved();
-    } catch (e: any) {
-      setError(e.message);
-    } finally {
-      setBusy(false);
-    }
-  }
-  return (
-    <Modal
-      title={`Import ${mode === "problem" ? "problems" : "cards"}`}
-      subtitle="Your content. Carefully organized."
-      onClose={onClose}
-      wide
-    >
-      <form onSubmit={submit}>
-        <div className="field-row">
-          <label className="form-field">
-            Default unit
-            <select
-              value={unitId}
-              required
-              onChange={(e) => setUnitId(e.target.value)}
-            >
-              {units.map((u) => (
-                <option key={u.id} value={u.id}>
-                  {u.name}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="form-field">
-            Format
-            <select value={format} onChange={(e) => setFormat(e.target.value)}>
-              <option value="json">JSON · all question formats</option>
-              <option value="csv">CSV · multiple choice</option>
-            </select>
-          </label>
-        </div>
-        <label className="file-drop">
-          <Upload size={22} />
-          <strong>{fileName || `Choose a ${format.toUpperCase()} file`}</strong>
-          <span>Or paste your data below</span>
-          <input
-            type="file"
-            accept={
-              format === "json" ? ".json,application/json" : ".csv,text/csv"
-            }
-            onChange={async (e) => {
-              const f = e.target.files?.[0];
-              if (f) {
-                setText(await f.text());
-                setFileName(f.name);
-              }
-            }}
-          />
-        </label>
-        <label className="form-field">
-          Import data
-          <textarea
-            className="code-editor"
-            rows={12}
-            required
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            placeholder={
-              format === "json"
-                ? JSON.stringify(
-                    mode === "problem"
-                      ? {
-                          problems: [
-                            {
-                              content: {
-                                type: "typed",
-                                prompt:
-                                  "Synthetic example: calculate 1/2 + 1/4.",
-                                answer: "3/4",
-                                grading: "numeric",
-                              },
-                              skills: ["fractions"],
-                              difficulty: 1,
-                            },
-                          ],
-                        }
-                      : sample,
-                    null,
-                    2,
-                  )
-                : "external_id,prompt,option_a,option_b,option_c,option_d,answer,explanation,skills"
-            }
-          />
-        </label>
-        <details className="import-help">
-          <summary>Format guide & example</summary>
-          {format === "json" ? (
-            <>
-              <p>
-                Each entry includes <code>content</code>, optional{" "}
-                <code>externalId</code>, <code>unitId</code>, and{" "}
-                <code>skills</code>. Stable external IDs prevent duplicate
-                imports. Supported types: multiple_choice, cloze,
-                multiple_select, matching, sequencing, true_false, typed.
-              </p>
-              <pre>{JSON.stringify(sample, null, 2)}</pre>
-              <button
-                type="button"
-                className="text-button"
-                onClick={() => {
-                  const blob = new Blob([JSON.stringify(sample, null, 2)], {
-                      type: "application/json",
-                    }),
-                    url = URL.createObjectURL(blob),
-                    a = document.createElement("a");
-                  a.href = url;
-                  a.download = "recall-import-example.json";
-                  a.click();
-                  URL.revokeObjectURL(url);
-                }}
-              >
-                <Download size={14} />
-                Download synthetic example
-              </button>
-            </>
-          ) : (
-            <p>
-              Header:{" "}
-              <code>
-                external_id,prompt,option_a,option_b,option_c,option_d,answer,explanation,skills
-              </code>
-              . Answer must match one option exactly. Separate skills with
-              semicolons. Quote fields containing commas or newlines.
-            </p>
-          )}
-        </details>
-        {mode === "card" && (
-          <div className="info-notice">
-            <Info size={16} />
-            <span>
-              Every imported card starts unintroduced. Importing never creates a
-              completed review.
-            </span>
-          </div>
-        )}
-        <ErrorNotice message={error} />
-        <div className="modal-actions">
-          <button type="button" className="button secondary" onClick={onClose}>
-            Cancel
-          </button>
-          <button className="button primary" disabled={busy || !text.trim()}>
-            {busy ? "Importing…" : "Import content"}
-            <Upload size={15} />
-          </button>
-        </div>
-      </form>
-    </Modal>
   );
 }
 function Editor({
@@ -807,8 +550,8 @@ function Editor({
         ...(mode === "problem"
           ? {
               difficulty,
-              hint: hint || undefined,
-              solution: solution || undefined,
+              hint,
+              solution,
             }
           : {}),
       };
@@ -816,8 +559,9 @@ function Editor({
         await api(`${mode === "problem" ? "problems" : "cards"}.update`, {
           id: item.id,
           ...payload,
-          resetSchedule: reset,
-          confirmReset: reset,
+          ...(mode === "card"
+            ? { resetSchedule: reset, confirmReset: reset }
+            : {}),
         });
       else
         await api(`${mode === "problem" ? "problems" : "cards"}.import`, {

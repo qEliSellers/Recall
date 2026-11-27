@@ -21,6 +21,16 @@ import {
 } from "./types";
 import { prepareQuestion, gradeQuestion, gradePhase } from "./questions";
 import {
+  cardsImportSchema,
+  importError,
+  libraryImportSchema,
+  problemFields,
+  problemsImportSchema,
+  skillTags as skills,
+} from "./import-format";
+import { MAX_IMPORT_ITEMS } from "./import-limits";
+import { importLibrary } from "./import-library";
+import {
   newSchedule,
   reviewSchedule,
   retrievability,
@@ -29,7 +39,6 @@ import {
 
 const id = z.string().min(1).max(100),
   name = z.string().trim().min(1).max(200),
-  skills = z.array(z.string().trim().min(1).max(100)).max(30),
   empty = z.object({}).strict();
 const pagination = {
   limit: z.number().int().min(1).max(200).default(100),
@@ -74,21 +83,6 @@ const courseUpdate = {
   maxInterval: z.number().int().min(1).max(36500).optional(),
   midtermUnitId: id.nullable().optional(),
 };
-const importCard = z
-  .object({
-    externalId: id.optional(),
-    unitId: id.optional(),
-    content: questionSchema,
-    skills: skills.default([]),
-  })
-  .strict();
-const problemFields = {
-  difficulty: z.number().int().min(1).max(5).default(2),
-  hint: z.string().max(10000).optional(),
-  solution: z.string().max(20000).optional(),
-  template: z.record(z.string(), z.unknown()).optional(),
-};
-const importProblem = importCard.extend(problemFields);
 const listInput = {
   courseId: id,
   unitId: id.optional(),
@@ -125,14 +119,9 @@ export const actionSchemas = {
     })
     .strict(),
   "cards.get": z.object({ id }).strict(),
-  "cards.import": z
-    .object({
-      courseId: id,
-      unitId: id.optional(),
-      batchId: id,
-      cards: z.array(importCard).min(1).max(1000),
-    })
-    .strict(),
+  "cards.import": cardsImportSchema,
+  "library.previewImport": libraryImportSchema,
+  "library.import": libraryImportSchema,
   "cards.update": z
     .object({
       id,
@@ -162,14 +151,7 @@ export const actionSchemas = {
     .strict(),
   "problems.list": z.object(listInput).strict(),
   "problems.get": z.object({ id }).strict(),
-  "problems.import": z
-    .object({
-      courseId: id,
-      unitId: id.optional(),
-      batchId: id,
-      problems: z.array(importProblem).min(1).max(1000),
-    })
-    .strict(),
+  "problems.import": problemsImportSchema,
   "problems.update": z
     .object({
       id,
@@ -189,7 +171,9 @@ export const actionSchemas = {
       scope: z.enum(["course", "unit", "midterm"]).default("course"),
       unitId: id.optional(),
       count: z.number().int().min(1).max(300).default(20),
-      selection: z.enum(["random", "balanced", "weak"]).default("random"),
+      selection: z
+        .enum(["random", "balanced", "weak", "ordered"])
+        .default("random"),
       feedback: z.enum(["immediate", "end"]).default("immediate"),
       includeUnintroduced: z.boolean().default(false),
       early: z.boolean().default(false),
@@ -473,7 +457,7 @@ async function contentList(
   );
   const items = await rows<any>(
     db,
-    `SELECT q.*${kind === "cards" ? ",s.fsrs,s.introduced_at,s.suspended,s.due,s.version AS schedule_version" : ""} FROM ${kind} q${join} WHERE ${filter} ORDER BY q.${kind === "cards" ? "position" : "created_at"},q.id LIMIT ? OFFSET ?`,
+    `SELECT q.*${kind === "cards" ? ",s.fsrs,s.introduced_at,s.suspended,s.due,s.version AS schedule_version" : ""} FROM ${kind} q${join} WHERE ${filter} ORDER BY q.position,q.id LIMIT ? OFFSET ?`,
     ...args,
     p.limit,
     p.offset,
@@ -486,139 +470,6 @@ async function contentList(
     nextOffset:
       p.offset + items.length < total ? p.offset + items.length : null,
   };
-}
-async function hash(value: unknown) {
-  const bytes = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(JSON.stringify(value)),
-  );
-  return Array.from(new Uint8Array(bytes))
-    .map((x) => x.toString(16).padStart(2, "0"))
-    .join("");
-}
-async function importContent(
-  db: Database,
-  user: string,
-  p: any,
-  kind: "cards" | "problems",
-) {
-  await ownedCourse(db, user, p.courseId);
-  const items = p[kind] as any[],
-    fingerprint = await hash({ kind, ...p });
-  const old = await one<any>(
-    db,
-    "SELECT * FROM import_batches WHERE user_id=? AND batch_key=?",
-    user,
-    p.batchId,
-  );
-  if (old) {
-    if (old.hash !== fingerprint)
-      fail(409, "This batch ID was already used for different content");
-    return { ...json(old.result), replayed: true };
-  }
-  const units = await rows<any>(
-      db,
-      "SELECT id FROM units WHERE course_id=?",
-      p.courseId,
-    ),
-    unitIds = new Set(units.map((u) => u.id));
-  const existing = await rows<any>(
-    db,
-    `SELECT external_id FROM ${kind} WHERE course_id=? AND external_id IS NOT NULL`,
-    p.courseId,
-  );
-  const externalIds = new Set(existing.map((c) => c.external_id));
-  const seen = new Set<string>();
-  const time = now();
-  const statements: Statement[] = [];
-  let skipped = 0;
-  const ids: string[] = [];
-  let order =
-    Number(
-      (
-        await one<any>(
-          db,
-          "SELECT MAX(position) AS n FROM cards WHERE course_id=?",
-          p.courseId,
-        )
-      )?.n ?? -1,
-    ) + 1;
-  for (const content of items) {
-    const unitId = content.unitId ?? p.unitId;
-    if (!unitId || !unitIds.has(unitId))
-      fail(400, "Every imported item must reference a unit in this course");
-    if (content.externalId && seen.has(content.externalId))
-      fail(400, "Duplicate externalId within this batch");
-    if (content.externalId) seen.add(content.externalId);
-    if (content.externalId && externalIds.has(content.externalId)) {
-      skipped++;
-      continue;
-    }
-    const itemId = uid();
-    ids.push(itemId);
-    if (kind === "cards")
-      statements.push(
-        stmt(
-          db,
-          "INSERT INTO cards(id,course_id,unit_id,external_id,content,skills,position,revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,1,?,?)",
-          itemId,
-          p.courseId,
-          unitId,
-          content.externalId ?? null,
-          JSON.stringify(content.content),
-          JSON.stringify(content.skills),
-          order++,
-          time,
-          time,
-        ),
-      );
-    else
-      statements.push(
-        stmt(
-          db,
-          "INSERT INTO problems(id,course_id,unit_id,external_id,content,skills,difficulty,hint,solution,template,revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?)",
-          itemId,
-          p.courseId,
-          unitId,
-          content.externalId ?? null,
-          JSON.stringify(content.content),
-          JSON.stringify(content.skills),
-          content.difficulty,
-          content.hint ?? null,
-          content.solution ?? null,
-          content.template ? JSON.stringify(content.template) : null,
-          time,
-          time,
-        ),
-      );
-  }
-  const result = { imported: ids.length, skipped, ids, batchId: p.batchId };
-  statements.unshift(
-    stmt(
-      db,
-      "INSERT INTO import_batches(id,user_id,batch_key,hash,result,created_at) VALUES(?,?,?,?,?,?)",
-      uid(),
-      user,
-      p.batchId,
-      fingerprint,
-      JSON.stringify(result),
-      time,
-    ),
-  );
-  try {
-    await db.batch(statements);
-  } catch (error) {
-    const retry = await one<any>(
-      db,
-      "SELECT * FROM import_batches WHERE user_id=? AND batch_key=?",
-      user,
-      p.batchId,
-    );
-    if (retry && retry.hash === fingerprint)
-      return { ...json(retry.result), replayed: true };
-    throw error;
-  }
-  return result;
 }
 async function introduce(db: Database, user: string, p: any) {
   const unit = await ownedUnit(db, user, p.unitId);
@@ -986,6 +837,10 @@ async function createSession(db: Database, user: string, p: any) {
     candidates.sort(
       (a, b) =>
         String(a.due).localeCompare(String(b.due)) || a.position - b.position,
+    );
+  else if (p.selection === "ordered")
+    candidates.sort(
+      (a, b) => a.position - b.position || a.id.localeCompare(b.id),
     );
   else candidates = shuffle(candidates);
   candidates = candidates.slice(0, p.count);
@@ -1536,6 +1391,7 @@ const tableColumns: Record<string, string[]> = {
     "hint",
     "solution",
     "template",
+    "position",
     "revision",
     "created_at",
     "updated_at",
@@ -1905,6 +1761,25 @@ function validateBackup(value: unknown) {
     backupTables.some((t) => !parsed.tables[t])
   )
     fail(400, "Backup must contain every supported table");
+  // Version 1 backups made before problem ordering used creation time, then ID.
+  const problems = parsed.tables.problems;
+  if (
+    problems.length &&
+    problems.every((row) => !Object.hasOwn(row, "position"))
+  ) {
+    const nextPosition = new Map<string, number>();
+    const oldOrder = [...problems].sort(
+      (a, b) =>
+        String(a.created_at).localeCompare(String(b.created_at)) ||
+        String(a.id).localeCompare(String(b.id)),
+    );
+    for (const row of oldOrder) {
+      const courseId = String(row.course_id);
+      const position = nextPosition.get(courseId) ?? 0;
+      row.position = position;
+      nextPosition.set(courseId, position + 1);
+    }
+  }
   let rowCount = 0;
   for (const table of backupTables) {
     for (const row of parsed.tables[table]) {
@@ -2092,7 +1967,27 @@ export async function execute(
   if (!user) fail(401, "Sign in is required");
   const schema = actionSchemas[action as ActionName];
   if (!schema) fail(404, "Unknown operation");
-  const p: any = schema.parse(input ?? {});
+  const importing =
+    action.endsWith(".import") || action === "library.previewImport";
+  if (importing && input && typeof input === "object") {
+    const { cards, problems } = input as Record<string, unknown>;
+    const count =
+      (Array.isArray(cards) ? cards.length : 0) +
+      (Array.isArray(problems) ? problems.length : 0);
+    if (count > MAX_IMPORT_ITEMS)
+      fail(
+        400,
+        `Include at most ${MAX_IMPORT_ITEMS} items total across cards and problems`,
+      );
+  }
+  let p: any;
+  try {
+    p = schema.parse(input ?? {});
+  } catch (error) {
+    if (error instanceof z.ZodError && importing)
+      fail(400, importError(error.issues));
+    throw error;
+  }
   switch (action) {
     case "settings.get":
       return getSettings(db, user);
@@ -2256,9 +2151,10 @@ export async function execute(
     case "problems.get":
       return problemJson(await ownedContent(db, user, p.id, "problems"));
     case "cards.import":
-      return importContent(db, user, p, "cards");
     case "problems.import":
-      return importContent(db, user, p, "problems");
+    case "library.import":
+    case "library.previewImport":
+      return importLibrary(db, user, p, action === "library.previewImport");
     case "cards.update":
       return updateContent(db, user, p, "cards");
     case "problems.update":

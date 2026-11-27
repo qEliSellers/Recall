@@ -15,6 +15,13 @@
       "when": 1794518588160,
       "tag": "0001_careful_lady_bullseye",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1795821138748,
+      "tag": "0002_yielding_warbound",
+      "breakpoints": true
     }
   ]
 }

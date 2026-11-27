@@ -121,6 +121,65 @@ try {
       .results,
     before.results,
   );
+  const bulkCourse = await action("courses.create", {
+    name: "Synthetic maximum-size mixed import",
+    isMath: true,
+    units: ["First", "Second"],
+  });
+  const bulk = (kind, count) =>
+    Array.from({ length: count }, (_, index) => ({
+      externalId: `${kind}-${index}`,
+      ...(index % 2 ? { unitName: "Second" } : {}),
+      content: {
+        ...content,
+        prompt: `Synthetic ${kind} ${index} ${"λ".repeat(3600)}`,
+      },
+    }));
+  const large = {
+    courseId: bulkCourse.id,
+    unitName: "First",
+    batchId: "worker-mixed-1000",
+    cards: bulk("card", 600),
+    problems: bulk("problem", 400),
+  };
+  const planned = await action("library.previewImport", large);
+  assert.equal(planned.imported, 1000);
+  assert.equal(
+    (await action("cards.list", { courseId: bulkCourse.id })).total,
+    0,
+  );
+  assert.equal(
+    (await action("problems.list", { courseId: bulkCourse.id })).total,
+    0,
+  );
+  const imported = await action("library.import", large);
+  assert.equal(imported.imported, 1000);
+  assert.deepEqual(imported.units, planned.units);
+  assert.equal((await action("library.import", large)).replayed, true);
+  for (const [table, entries] of [
+    ["cards", large.cards],
+    ["problems", large.problems],
+  ]) {
+    const ordered = await db
+      .prepare(
+        `SELECT q.external_id, q.position, u.name FROM ${table} q JOIN units u ON u.id=q.unit_id WHERE q.course_id=? ORDER BY q.position`,
+      )
+      .bind(bulkCourse.id)
+      .all();
+    assert.deepEqual(
+      ordered.results,
+      entries.map((entry, index) => ({
+        external_id: entry.externalId,
+        position: index,
+        name: entry.unitName ?? "First",
+      })),
+    );
+  }
+  assert.equal(
+    (await action("courses.get", { id: bulkCourse.id })).course.introducedCards,
+    0,
+  );
+
   const media = new FormData();
   media.set(
     "file",
@@ -183,7 +242,7 @@ try {
     1,
   );
   console.log(
-    "Worker smoke passed: built assets, auth, D1 migrations/import/introduction/atomic FSRS, quiz isolation, R2 media, complete backup restore.",
+    "Worker smoke passed: built assets, auth, D1 migrations, ordered 1,000-item mixed import, introduction, atomic FSRS, quiz isolation, R2 media, and complete backup restore.",
   );
 } finally {
   await runtime.dispose();

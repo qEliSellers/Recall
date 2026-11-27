@@ -358,6 +358,7 @@ export function SessionSetup({
                   <option value="random">Random</option>
                   <option value="balanced">Balanced across units</option>
                   <option value="weak">Prioritize weak areas</option>
+                  <option value="ordered">Library order</option>
                 </select>
               </label>
             )}

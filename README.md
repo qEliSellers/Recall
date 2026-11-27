@@ -27,7 +27,7 @@ npm test
 ## Study workflow
 
 1. Create a custom course or choose a verified Acellus course structure. Add, rename, and reorder units, then choose a midterm boundary.
-2. Import JSON or CSV cards into a unit. Imports are library content with no schedules and zero review history.
+2. Check and import a JSON batch of cards or math problems into one or more units. Use CSV for single-answer multiple choice. Cards stay unintroduced and preserve their import order within each unit.
 3. Introduce the next N cards, or selected cards, when ready. Suspension keeps the existing state and history.
 4. Answer scheduled reviews and choose Again, Hard, Good, or Easy. Each final rating atomically saves a standard FSRS transition and one review event.
 5. Use Practice Quiz for 1–300 questions, or Problem Practice in math courses. These record performance without updating FSRS schedules.

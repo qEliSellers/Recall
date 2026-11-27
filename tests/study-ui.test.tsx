@@ -1,7 +1,14 @@
 // @vitest-environment happy-dom
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { readFileSync, readdirSync } from "node:fs";
 import { createDatabase } from "../lib/sqlite";
@@ -9,6 +16,7 @@ import { execute } from "../lib/service";
 import { rows } from "../lib/db";
 import { handleApi } from "../worker/api";
 import { StudySession } from "../src/StudySession";
+import ImportDialog from "../src/ImportDialog";
 import type { Env } from "../worker/env";
 
 let db: ReturnType<typeof createDatabase>;
@@ -76,6 +84,89 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   db.close();
+});
+
+it("uploads a mixed JSON file, previews unit destinations, invalidates edits, then saves", async () => {
+  const course = await call("courses.create", {
+    name: "Synthetic import UI",
+    isMath: true,
+    units: ["First", "Second"],
+  });
+  const { units } = await call("courses.get", { id: course.id });
+  const data = JSON.stringify({
+    version: 1,
+    batchId: "test-import-ui",
+    courseId: course.id,
+    unitName: "First",
+    cards: [{ externalId: "cloze", content: cloze }],
+    problems: [
+      {
+        externalId: "fraction",
+        unitName: "Second",
+        content: { type: "typed", prompt: "One half", answer: "1/2" },
+      },
+    ],
+  });
+  const saved = vi.fn();
+  const user = userEvent.setup();
+  render(
+    <ImportDialog
+      course={course}
+      units={units}
+      kind="cards"
+      initialUnitId=""
+      onClose={() => {}}
+      onSaved={saved}
+    />,
+  );
+  await user.upload(
+    screen.getByLabelText("Import file"),
+    new File([data], "synthetic.json", { type: "application/json" }),
+  );
+  await screen.findByText("synthetic.json");
+  const check = () =>
+    user.click(screen.getByRole("button", { name: "Check batch" }));
+  await check();
+  const preview = await screen.findByRole("status", { name: "Import preview" });
+  expect(
+    within(preview).getByRole("row", { name: "First 1 0 0" }),
+  ).toBeTruthy();
+  expect(
+    within(preview).getByRole("row", { name: "Second 0 1 0" }),
+  ).toBeTruthy();
+  expect((await call("cards.list", { courseId: course.id })).total).toBe(0);
+
+  const field = screen.getByRole("textbox", { name: "Import data" });
+  fireEvent.change(field, {
+    target: {
+      value: data.replace('"unitName":"Second"', '"unitName":"Missing"'),
+    },
+  });
+  expect(screen.queryByRole("button", { name: "Import 2 items" })).toBeNull();
+  await check();
+  expect((await screen.findByRole("alert")).textContent).toMatch(
+    /Problem 1.*Missing/,
+  );
+  expect(saved).not.toHaveBeenCalled();
+
+  fireEvent.change(field, { target: { value: data } });
+  await check();
+  await user.click(
+    await screen.findByRole("button", { name: "Import 2 items" }),
+  );
+  await waitFor(() =>
+    expect(saved).toHaveBeenCalledWith(
+      expect.objectContaining({ imported: 2, skipped: 0 }),
+    ),
+  );
+  expect(
+    (await call("cards.list", { courseId: course.id, unitId: units[0].id }))
+      .items[0],
+  ).toMatchObject({ status: "unintroduced", externalId: "cloze" });
+  expect(
+    (await call("problems.list", { courseId: course.id, unitId: units[1].id }))
+      .items[0],
+  ).toMatchObject({ externalId: "fraction" });
 });
 
 async function clozeSession(mode = "review", feedback = "immediate") {

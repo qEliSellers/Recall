@@ -1,53 +1,101 @@
-# Content import format
+# Recall import format
 
-Import adds content to the library. It does **not** introduce cards, create review events, or assign learned intervals. Use the unit's introduction controls afterward. Mathematical problems live in Problem Practice and do not acquire FSRS schedules.
+For generated batches, use **UTF-8 JSON, version 1**. In the target course, open **Card library → Import** or, for a math course, **Problem Practice → Import**. Paste a batch or choose a file, then select **Check batch**. Recall shows the unit and the number of new cards, new problems, and duplicates for each destination. This check leaves the library untouched. Confirm the import after reviewing the counts.
 
-The canonical validation code is `lib/types.ts` for question content and `lib/service.ts` for import envelopes. JSON examples below use synthetic content to illustrate the format; the app does not generate educational material.
+**Download synthetic JSON example** in the import dialog gives you a valid file with all seven question formats, the active course's ID, and real unit IDs. For a math course the example also contains two practice problems. Use **Unit names and IDs for this course** to copy destinations into a generator. Use your own prompts and IDs in generated files.
 
-## Card import request
+## Generate a JSON batch
 
-The browser API accepts `POST /api/action` with `Content-Type: application/json` and an `{ "action", "input" }` envelope. The `import_cards` MCP tool accepts the same input fields directly. Course and unit IDs come from your own course records; catalog IDs are not database IDs.
+One file targets one existing course. A math course can receive both `cards` and `problems` in the same file. Use the cards array for material you may introduce into reviews or use in quizzes. Use the problems array for exercises in Problem Practice. Newly imported cards are **unintroduced**, with no FSRS schedule or review events. Practice problems have no FSRS schedule.
 
 ```json
 {
-  "action": "cards.import",
-  "input": {
-    "courseId": "your-course-id",
-    "unitId": "your-unit-id",
-    "batchId": "algebra-unit-1-v1",
-    "cards": [
-      {
-        "externalId": "arithmetic-001",
-        "skills": ["addition"],
-        "content": {
-          "type": "multiple_choice",
-          "prompt": "Which value equals 2 + 2?",
-          "options": [
-            { "id": "four", "text": "4" },
-            { "id": "five", "text": "5" }
-          ],
-          "correctOptionIds": ["four"]
-        }
+  "version": 1,
+  "batchId": "algebra-foundations-001",
+  "unitName": "Foundations",
+  "cards": [
+    {
+      "externalId": "algebra-foundations-card-001",
+      "skills": ["addition"],
+      "content": {
+        "type": "multiple_choice",
+        "prompt": "Which value equals 2 + 2?",
+        "options": [
+          { "id": "four", "text": "4" },
+          { "id": "five", "text": "5" }
+        ],
+        "correctOptionIds": ["four"]
       }
-    ]
-  }
+    }
+  ],
+  "problems": [
+    {
+      "externalId": "algebra-expressions-problem-001",
+      "unitName": "Expressions",
+      "skills": ["distribution"],
+      "difficulty": 2,
+      "hint": "Distribute the 2 across both terms.",
+      "solution": "The result is $2x+2$.",
+      "content": {
+        "type": "typed",
+        "prompt": "Expand $2(x+1)$.",
+        "answer": "2*x+2",
+        "grading": "expression",
+        "variables": ["x"]
+      }
+    }
+  ]
 }
 ```
 
-A batch contains 1–1,000 cards. `courseId`, `batchId`, and `cards` are required. A default `unitId` can be supplied at batch level, or each card can specify its own `unitId`; the chosen unit must belong to the target course. Each card has required `content`, optional `externalId`, and optional `skills` (default `[]`). There are at most 30 skill strings, each nonempty and at most 100 characters. IDs are nonempty strings of at most 100 characters.
+Replace `Foundations` and `Expressions` with units in your own course. Include a `courseId` from the downloadable example if you want the file to be locked to that course.
 
-Keep `batchId` stable when retrying the same request and use a new ID for a genuinely new batch. Use stable `externalId` values for content produced outside the app. A card's internal database ID is assigned by the app; it is not its external ID. Replaying the same batch ID and payload returns the prior result (with `replayed: true`) without inserting duplicates. Reusing that batch ID for changed content returns HTTP 409. Duplicate external IDs inside a single batch are rejected. An external ID already present in the target course is **skipped**, even if the incoming content differs; existing cards are never overwritten by import. The response includes `imported`, `skipped`, `ids`, and `batchId`. Use the explicit edit operation for changes.
+| Field | Rules |
+| --- | --- |
+| `version` | Required for this format. Use the number `1`. |
+| `batchId` | Required in version 1. A string of 1–100 characters with no surrounding whitespace. Keep it stable across retries. Use a fresh ID for a different batch. IDs are unique across your library. |
+| `courseId` | Optional. If present, it must match the course open in Recall. Use a Recall course ID, rather than an Acellus catalog ID. |
+| `unitId` or `unitName` | Optional batch destination. Use only one. A file destination takes precedence over the dialog's Default unit. |
+| `cards`, `problems` | Include at least one array. Across both arrays, supply 1–1,000 entries. Entry order within each array is significant. |
+| Each entry | Requires a `content` object. An optional `unitId` or `unitName` overrides the batch destination for that entry. `externalId` and `skills` are optional. Supply up to 30 distinct skill tags of 1–100 characters each. |
+
+Use an exact, case-sensitive `unitName`, including punctuation. If two units share a name, use the stable `unitId` for the intended one. Every entry must resolve to a unit that already belongs to the open course. The check rejects missing, ambiguous, and out-of-course units. It never creates a unit to fit a typo. A versioned file can contain both arrays regardless of which library tab opened the dialog.
+
+The file and outgoing request are limited to 8 MiB each. An individual prepared item is limited to 256 KiB. Keep the file comfortably under the limits to leave room for the request envelope and generated storage fields. Split larger exports into numbered batches and import the batches in the order you want them appended. JSON must have unique keys and valid syntax. Omit optional values you don't need. Unknown fields, comments, and trailing commas are rejected.
+
+## Order, duplicates, and retries
+
+- Recall appends new entries after the existing library, preserving their relative order in each array. For example, if the file has units A, B, A, the two new items in A appear in their file order when you filter to A. **Introduce next N** follows that order within the unit. Set quiz or problem selection to **Library order** to study in that order.
+- Use a stable `externalId` for each item you generate. Its length is 1–100 characters, and it must be unique per course and item kind. A card and a problem can share an ID. Two cards in the same file cannot, even across units.
+- On a new batch, Recall skips IDs already present in the same unit and keeps the stored content and position. If an existing ID points to a different unit, the import rejects the conflict. Move the existing entry explicitly or give the new item its own ID. Edit existing content through the library or API.
+- Submitting the same parsed content, destinations, and order with the same batch ID returns the original receipt. Reusing that ID with different content, destinations, or order is an error. JSON whitespace and object key order do not affect retry identity. The entire import saves together. A rejected entry leaves the entire batch unsaved, and you can correct it and retry.
+- The browser also accepts unversioned `cards` or `problems` objects, the corresponding legacy API envelopes, and plain arrays. Plain arrays use the kind of the open library. Files without a batch ID, including CSV, get a content-derived ID for safe reupload of the same batch in the same destination. Use the versioned format for generated files.
+
+## CSV for single-answer multiple choice
+
+Open the intended library first. CSV rows become cards in Card library, or problems in Problem Practice. Save UTF-8, use commas, and keep one header row. Required columns are `prompt`, `option_a`, `option_b`, and `answer`. Fill all four fields on every row. Optional columns include `option_c`, `option_d`, `external_id`, `unit_id`, `unit_name`, `explanation`, and `skills`. In Problem Practice, `difficulty`, `hint`, and `solution` are also available.
+
+```csv
+external_id,unit_name,prompt,option_a,option_b,answer,explanation,skills
+algebra-card-001,Foundations,"What is 2 + 2, in decimal notation?",4,5,4,"2 + 2 = 4",addition;arithmetic
+```
+
+Use the answer's full option text, with exact case. Surround fields containing commas, quotes, or line breaks with double quotes. Escape a double quote inside a quoted field by writing two double quotes. Separate skills with semicolons. Column names and surrounding field whitespace are normalized. Extra or missing fields, unknown or duplicate column names, malformed quotes, and unmatched answers are errors. Use JSON for more than four choices, any other question type, images, variants, or template metadata.
+
+## API and plugin imports
+
+The browser and MCP use the same library rules. To import cards via the MCP tool `import_cards`, pass `courseId`, `batchId`, `cards`, and an optional batch `unitId` or `unitName`. To call the authenticated browser API, send an `{ "action", "input" }` JSON envelope to `/api/action`. Available actions are `cards.import`, `problems.import`, `library.previewImport`, and `library.import`. Put course and destination fields and the arrays inside `input`. The `version` field is only for uploaded files. The single-kind actions require a `batchId`. The result includes `imported`, `skipped`, `ids`, `batchId`, and counts by destination. Imports from prior versions may return a receipt without per-unit counts.
 
 ## Problem import request
 
-Use `"action": "problems.import"` and replace `cards` with `problems`. The course, unit, batch, external-ID, content, and skill fields behave the same way. Each problem may additionally contain:
+Add problems in the `problems` array of a math course's batch. The course, unit, batch, external ID, content, and skill fields work the same way as for cards. Problems may additionally contain:
 
 | Field        | Type/default                    | Meaning                                                                                   |
 | ------------ | ------------------------------- | ----------------------------------------------------------------------------------------- |
 | `difficulty` | integer 1–5; default 2          | Author-defined difficulty.                                                                |
 | `hint`       | string, up to 10,000 characters | Optional hint available during practice.                                                  |
 | `solution`   | string, up to 20,000 characters | Worked solution shown after answering.                                                    |
-| `template`   | JSON object                     | Optional reusable-template metadata and instantiated values. It does not run a generator. |
+| `template`   | JSON object                     | Optional reusable-template metadata and instantiated values. Up to 20 nested levels. |
 
 Problems can use any supported content type, including multiple choice and typed mathematics. Importing a problem never creates a card schedule.
 
@@ -64,7 +112,7 @@ Every question has a `type` and a nonempty `prompt`. These shared fields are opt
 
 Prompts and explanations are limited to 20,000 characters. Images have a 2,000-character URL limit and 500-character alternative-text limit. Question objects are strict: unknown fields are rejected instead of silently ignored.
 
-A variant is `{ "id": "alternate", "prompt": "An alternate version of the prompt" }`. It may include `componentPrompts`, a map from source component IDs to alternate prompts. At most 30 variants are accepted; variant IDs must be unique. Keep the same answer meaning across variants. The selected variant and presentation are saved with each attempt.
+A variant is `{ "id": "alternate", "prompt": "An alternate version of the prompt" }`. It may include `componentPrompts`, a map from source IDs to alternate prompts. Use the blank IDs for cloze, pair IDs for matching, or `main` for choice questions. Sequencing and typed questions support top-level prompt variants. At most 30 variants are accepted, and variant IDs must be unique. Keep the same answer meaning across variants. The selected variant and presentation are saved with each attempt.
 
 ### Single-choice and true/false
 
@@ -86,7 +134,7 @@ A variant is `{ "id": "alternate", "prompt": "An alternate version of the prompt
 
 `multiple_choice` requires exactly one correct option. `true_false` uses the same fields, exactly two options, and one correct option. Option IDs and normalized option text must be distinct; correct IDs must exist in the options. A question needs at least one distractor.
 
-The full `options` array is a stored pool of 2–60 choices. `optionCount` is optional and selects a smaller presentation containing every correct option plus distractors. Single-choice questions default to at most four presented choices; the display order is randomized. Source option IDs are replaced by presentation IDs in study responses. The author remains responsible for semantic ambiguity: a validator can detect duplicate strings, not prove two different answers cannot both be correct.
+The full `options` array is a stored pool of 2–60 choices. `optionCount` is optional and selects a presentation containing every correct option and at least one distractor. Its value cannot exceed the number of stored choices. Single-choice questions default to at most four presented choices, in randomized order. Source option IDs are replaced by presentation IDs in study responses. Review the content for ambiguous options and answer clues.
 
 ### Multiple select
 
@@ -179,7 +227,7 @@ Imports and content editing require an authenticated owner. The owner can retrie
 
 ## Media and backups
 
-Upload images through the app and use their returned `/api/media/…` paths in the content. Imported HTTPS image URLs remain dependent on that external host and are not automatically fetched into managed storage. A temporary local path, `file:` URL, or development-server URL is not a durable media reference. The complete backup format is separate from a content import: it also includes scheduling, histories, settings, and uploaded assets.
+Upload images through the app and use their returned `/api/media/…` paths in the content. The check verifies that those uploaded paths exist in your account. For external HTTPS images, verify the links yourself. They remain on the external host and Recall stores the link.
 
 ## Full backup and restore
 
