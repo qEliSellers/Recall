@@ -357,15 +357,24 @@ async function contentCounts(
   }
   const r = await one<any>(
     db,
-    `SELECT COUNT(*) AS totalCards,SUM(CASE WHEN s.card_id IS NOT NULL THEN 1 ELSE 0 END) AS introducedCards,SUM(CASE WHEN s.card_id IS NULL THEN 1 ELSE 0 END) AS unintroducedCards,SUM(CASE WHEN s.card_id IS NOT NULL AND s.suspended=0 THEN 1 ELSE 0 END) AS activeCards,SUM(CASE WHEN s.suspended=1 THEN 1 ELSE 0 END) AS suspendedCards,SUM(CASE WHEN s.card_id IS NOT NULL AND s.suspended=0 AND s.due<=? AND NOT(c.archived=1 AND c.archive_mode='paused') THEN 1 ELSE 0 END) AS dueCards,SUM(CASE WHEN s.card_id IS NOT NULL AND json_extract(s.fsrs,'$.reps')=0 THEN 1 ELSE 0 END) AS newCards FROM cards q JOIN courses c ON c.id=q.course_id LEFT JOIN schedules s ON s.card_id=q.id WHERE c.user_id=?${filter}`,
+    `SELECT COUNT(*) AS totalCards,
+       SUM(s.card_id IS NOT NULL) AS introducedCards,
+       SUM(s.card_id IS NULL) AS unintroducedCards,
+       SUM(s.suspended=0) AS activeCards,
+       SUM(s.suspended=1) AS suspendedCards,
+       SUM(s.suspended=0 AND s.due<=? AND NOT(c.archived=1 AND c.archive_mode='paused')) AS dueCards,
+       SUM(json_extract(s.fsrs,'$.reps')=0) AS newCards,
+       MIN(CASE WHEN s.suspended=0 AND NOT(c.archived=1 AND c.archive_mode='paused') THEN s.due END) AS nextReviewAt
+     FROM cards q JOIN courses c ON c.id=q.course_id LEFT JOIN schedules s ON s.card_id=q.id
+     WHERE c.user_id=?${filter}`,
     ...args,
   );
-  return Object.fromEntries(
-    Object.entries({ ...zeroCounts(), ...r }).map(([k, v]) => [
-      k,
-      Number(v ?? 0),
-    ]),
-  );
+  return {
+    ...Object.fromEntries(
+      Object.keys(zeroCounts()).map((key) => [key, Number(r?.[key] ?? 0)]),
+    ),
+    nextReviewAt: (r?.nextReviewAt ?? null) as string | null,
+  };
 }
 async function courseSummary(db: Database, user: string, r: any) {
   return {
@@ -398,15 +407,21 @@ async function courseDetail(db: Database, user: string, courseId: string) {
     "SELECT * FROM units WHERE course_id=? ORDER BY position,id",
     courseId,
   );
-  return {
-    course: await courseSummary(db, user, course),
-    units: await Promise.all(
+  const [summary, detailedUnits, [resumeSession]] = await Promise.all([
+    courseSummary(db, user, course),
+    Promise.all(
       units.map(async (r) => ({
         ...camel(r),
         order: r.position,
         ...(await contentCounts(db, user, courseId, r.id)),
       })),
     ),
+    sessionsList(db, user, { courseId, limit: 1 }, true),
+  ]);
+  return {
+    course: summary,
+    units: detailedUnits,
+    resumeSession: resumeSession ?? null,
   };
 }
 async function contentList(
@@ -610,7 +625,8 @@ async function ownedSession(db: Database, user: string, sessionId: string) {
   return (
     (await one<any>(
       db,
-      "SELECT * FROM sessions WHERE id=? AND user_id=?",
+      `SELECT s.*, (c.archived=1 AND c.archive_mode='paused') AS course_paused
+       FROM sessions s JOIN courses c ON c.id=s.course_id WHERE s.id=? AND s.user_id=?`,
       sessionId,
       user,
     )) ?? fail(404, "Session not found")
@@ -625,25 +641,68 @@ async function sessionItems(db: Database, sessionId: string) {
 }
 const finished = (session: any, item: any) =>
   item.answered_at !== null &&
-  json<GradeResult | null>(item.grade)?.correct !== null &&
+  json<GradeResult | null>(item.grade)?.correct != null &&
   (session.mode !== "review" || item.reviewed_at !== null);
+const finishedSessionItem = `i.answered_at IS NOT NULL AND json_extract(i.grade,'$.correct') IS NOT NULL
+  AND (s.mode<>'review' OR i.reviewed_at IS NOT NULL)`;
+const unavailableSessionItem = `(s.mode='review' AND (sch.card_id IS NULL OR sch.suspended=1 OR sch.version IS NOT i.schedule_version))
+  OR (s.mode='quiz' AND (i.card_id IS NULL OR sch.suspended IS 1))
+  OR (s.mode='problem' AND i.problem_id IS NULL)`;
+const canWriteSessionItem = `i.skipped_at IS NULL AND EXISTS (
+  SELECT 1 FROM sessions s LEFT JOIN courses c ON c.id=s.course_id
+  LEFT JOIN schedules sch ON sch.card_id=i.card_id
+  WHERE s.id=i.session_id AND s.status='active'
+    AND NOT (s.mode='review' AND c.archived=1 AND c.archive_mode='paused')
+    AND NOT (${unavailableSessionItem})
+)`;
+
+async function activeSessionItems(db: Database, session: any) {
+  if (session.status === "active") {
+    // Keep answered history, and persist each skip so a reload or reactivation cannot reopen it.
+    await run(
+      db,
+      `UPDATE session_items AS i SET skipped_at=? WHERE i.session_id=? AND i.skipped_at IS NULL AND EXISTS (
+        SELECT 1 FROM sessions s LEFT JOIN schedules sch ON sch.card_id=i.card_id
+        WHERE s.id=i.session_id AND s.status='active'
+          AND NOT (${finishedSessionItem}) AND (${unavailableSessionItem})
+      )`,
+      now(),
+      session.id,
+    );
+  }
+  return sessionItems(db, session.id);
+}
+
+const currentSessionItem = (session: any, items: any[]) =>
+  items.find((item) => !item.skipped_at && !finished(session, item));
+
+async function loadSessionItem(db: Database, user: string, p: any) {
+  const session = await ownedSession(db, user, p.id);
+  const items = await activeSessionItems(db, session);
+  const item =
+    items.find((entry) => entry.id === p.itemId) ??
+    fail(404, "Question not found");
+  return { session, items, item };
+}
+
 async function sessionView(
   db: Database,
   user: string,
   sessionId: string,
   lastAnswer?: any,
 ) {
-  const session = await ownedSession(db, user, sessionId),
-    items = await sessionItems(db, sessionId);
-  const answered = items.filter((i) => finished(session, i)).length,
-    current = items.find((i) => !finished(session, i));
+  const session = await ownedSession(db, user, sessionId);
+  const all = await activeSessionItems(db, session);
+  const items = all.filter((i) => !i.skipped_at);
+  const answered = items.filter((i) => finished(session, i)).length;
+  const current = currentSessionItem(session, items);
   const complete = !current;
   let completedAt = session.completed_at;
   if (complete && session.status !== "completed") {
     completedAt = now();
     await run(
       db,
-      "UPDATE sessions SET status='completed',completed_at=? WHERE id=?",
+      "UPDATE sessions SET status='completed',completed_at=COALESCE(completed_at,?) WHERE id=?",
       completedAt,
       session.id,
     );
@@ -655,11 +714,14 @@ async function sessionView(
     status: complete ? "completed" : "active",
     total: items.length,
     answered,
-    index: current?.position ?? items.length,
+    index: current ? items.indexOf(current) : items.length,
     createdAt: session.created_at,
     completedAt,
   };
-  if (current) {
+  if (all.length > items.length) view.skipped = all.length - items.length;
+  if (current && session.mode === "review" && session.course_paused)
+    view.paused = true;
+  else if (current) {
     const prepared = json<PreparedQuestion>(current.prepared),
       snapshot = json<any>(current.snapshot),
       grade = json<GradeResult | null>(current.grade),
@@ -774,14 +836,13 @@ async function createSession(db: Database, user: string, p: any) {
   let join = "";
   if (kind === "cards") {
     join = " LEFT JOIN schedules s ON s.card_id=q.id";
-    if (p.mode === "review") {
-      filter += " AND s.card_id IS NOT NULL AND s.suspended=0";
-      if (!p.early) {
-        filter += " AND s.due<=?";
-        args.push(now());
-      }
-    } else if (!p.includeUnintroduced)
-      filter += " AND s.card_id IS NOT NULL AND s.suspended=0";
+    filter += " AND s.suspended IS NOT 1";
+    if (p.mode === "review" || !p.includeUnintroduced)
+      filter += " AND s.card_id IS NOT NULL";
+    if (p.mode === "review" && !p.early) {
+      filter += " AND s.due<=?";
+      args.push(now());
+    }
   }
   let candidates = await rows<any>(
     db,
@@ -795,7 +856,12 @@ async function createSession(db: Database, user: string, p: any) {
     const source = await sessionItems(db, retry.id);
     const missed = new Set(
       source
-        .filter((i) => json<GradeResult | null>(i.grade)?.correct === false)
+        .filter(
+          (i) =>
+            !i.skipped_at &&
+            finished(retry, i) &&
+            json<GradeResult | null>(i.grade)?.correct === false,
+        )
         .map((i) => (kind === "cards" ? i.card_id : i.problem_id)),
     );
     candidates = candidates.filter((c) => missed.has(c.id));
@@ -803,7 +869,8 @@ async function createSession(db: Database, user: string, p: any) {
   if (p.selection === "weak") {
     const attempts = await rows<any>(
       db,
-      `SELECT i.card_id,i.problem_id,i.grade FROM session_items i JOIN sessions s ON s.id=i.session_id WHERE s.user_id=? AND s.course_id=? AND i.answered_at IS NOT NULL`,
+      `SELECT i.card_id,i.problem_id,i.grade FROM session_items i JOIN sessions s ON s.id=i.session_id
+       WHERE s.user_id=? AND s.course_id=? AND i.skipped_at IS NULL AND ${finishedSessionItem}`,
       user,
       p.courseId,
     );
@@ -847,9 +914,15 @@ async function createSession(db: Database, user: string, p: any) {
   if (!candidates.length)
     fail(
       400,
-      p.mode === "review"
-        ? "No due cards in this scope. Introduce cards or deliberately enable early review."
-        : "No eligible questions in this scope. Import content or include unintroduced cards.",
+      p.retrySessionId
+        ? "No missed questions are available to retry."
+        : p.mode === "review"
+          ? "No cards are available to review in this scope."
+          : p.mode === "problem"
+            ? "No problems match this scope. Change the scope or add problems to this course."
+            : p.includeUnintroduced
+              ? "No available cards match this scope. Change the scope or check your card library."
+              : "No active cards match this scope. Change the scope or include unintroduced cards.",
     );
   const sessionId = uid(),
     time = now();
@@ -893,14 +966,9 @@ async function createSession(db: Database, user: string, p: any) {
   return sessionView(db, user, sessionId);
 }
 async function answerSession(db: Database, user: string, p: any) {
-  const session = await ownedSession(db, user, p.id);
-  const item =
-    (await one<any>(
-      db,
-      "SELECT * FROM session_items WHERE id=? AND session_id=?",
-      p.itemId,
-      p.id,
-    )) ?? fail(404, "Question not found");
+  const { session, items, item } = await loadSessionItem(db, user, p);
+  if (item.skipped_at || (session.mode === "review" && session.course_paused))
+    return sessionView(db, user, p.id);
   const options = json<any>(session.options),
     prepared = json<PreparedQuestion>(item.prepared);
   const previous = json<GradeResult | null>(item.grade);
@@ -920,8 +988,7 @@ async function answerSession(db: Database, user: string, p: any) {
       p.id,
       session.mode !== "review" ? feedback(previous) : undefined,
     );
-  const all = await sessionItems(db, p.id),
-    current = all.find((i) => !finished(session, i));
+  const current = currentSessionItem(session, items);
   if (current?.id !== item.id) fail(409, "Answer the current question first");
   let response = p.response;
   const phases = json<any>(item.phase_progress, { answers: {}, elapsedMs: 0 });
@@ -944,7 +1011,9 @@ async function answerSession(db: Database, user: string, p: any) {
   const statements = [
     stmt(
       db,
-      "UPDATE session_items SET response=?,grade=?,response_ms=?,answered_at=? WHERE id=? AND (answered_at IS NULL OR json_extract(grade,'$.requiresManual')=1)",
+      `UPDATE session_items AS i SET response=?,grade=?,response_ms=?,answered_at=?
+       WHERE i.id=? AND (i.answered_at IS NULL OR json_extract(i.grade,'$.requiresManual')=1)
+       AND ${canWriteSessionItem}`,
       JSON.stringify(response),
       JSON.stringify(grade),
       previous ? item.response_ms : p.responseMs,
@@ -956,7 +1025,9 @@ async function answerSession(db: Database, user: string, p: any) {
     statements.push(
       stmt(
         db,
-        "INSERT OR IGNORE INTO problem_attempts(id,user_id,problem_id,session_item_id,correct,grade,response_ms,created_at) SELECT ?,?,?,?,json_extract(grade,'$.correct'),grade,response_ms,? FROM session_items WHERE id=? AND json_extract(grade,'$.correct') IS NOT NULL",
+        `INSERT OR IGNORE INTO problem_attempts(id,user_id,problem_id,session_item_id,correct,grade,response_ms,created_at)
+         SELECT ?,?,?,?,json_extract(grade,'$.correct'),grade,response_ms,? FROM session_items
+         WHERE id=? AND skipped_at IS NULL AND json_extract(grade,'$.correct') IS NOT NULL`,
         uid(),
         user,
         item.problem_id,
@@ -969,28 +1040,26 @@ async function answerSession(db: Database, user: string, p: any) {
   await db.batch(statements);
   const saved = await one<any>(
     db,
-    "SELECT grade FROM session_items WHERE id=?",
+    "SELECT grade,skipped_at FROM session_items WHERE id=?",
     item.id,
   );
+  const savedGrade = saved?.skipped_at
+    ? null
+    : json<GradeResult | null>(saved?.grade);
   return sessionView(
     db,
     user,
     p.id,
-    session.mode !== "review" && !grade.requiresManual
-      ? feedback(json(saved?.grade))
+    session.mode !== "review" && savedGrade && !savedGrade.requiresManual
+      ? feedback(savedGrade)
       : undefined,
   );
 }
 
 async function phaseSession(db: Database, user: string, p: any) {
-  const session = await ownedSession(db, user, p.id),
-    item =
-      (await one<any>(
-        db,
-        "SELECT * FROM session_items WHERE id=? AND session_id=?",
-        p.itemId,
-        p.id,
-      )) ?? fail(404, "Question not found");
+  const { session, items, item } = await loadSessionItem(db, user, p);
+  if (item.skipped_at || (session.mode === "review" && session.course_paused))
+    return sessionView(db, user, p.id);
   const prepared = json<PreparedQuestion>(item.prepared);
   if (prepared.presentation.type !== "cloze")
     fail(400, "Phased responses apply only to cloze cards");
@@ -1021,9 +1090,7 @@ async function phaseSession(db: Database, user: string, p: any) {
     return view;
   }
   if (item.answered_at) fail(409, "This question is already answered");
-  const current = (await sessionItems(db, p.id)).find(
-    (i) => !finished(session, i),
-  );
+  const current = currentSessionItem(session, items);
   if (current?.id !== item.id) fail(409, "Answer the current question first");
   if (index !== Object.keys(progress.answers).length)
     fail(409, "Answer cloze components in order");
@@ -1033,7 +1100,8 @@ async function phaseSession(db: Database, user: string, p: any) {
   progress.elapsedMs = Math.min(3600000, progress.elapsedMs + p.responseMs);
   const changed = await run(
     db,
-    "UPDATE session_items SET phase_progress=? WHERE id=? AND phase_progress IS ?",
+    `UPDATE session_items AS i SET phase_progress=?
+     WHERE i.id=? AND i.phase_progress IS ? AND i.answered_at IS NULL AND ${canWriteSessionItem}`,
     JSON.stringify(progress),
     item.id,
     item.phase_progress,
@@ -1057,23 +1125,19 @@ async function phaseSession(db: Database, user: string, p: any) {
 }
 
 async function rateSession(db: Database, user: string, p: any) {
-  const session = await ownedSession(db, user, p.id);
+  const { session, items, item } = await loadSessionItem(db, user, p);
   if (session.mode !== "review")
     fail(400, "Only scheduled review accepts FSRS ratings");
-  const item =
-    (await one<any>(
-      db,
-      "SELECT * FROM session_items WHERE id=? AND session_id=?",
-      p.itemId,
-      p.id,
-    )) ?? fail(404, "Question not found");
   if (item.reviewed_at) return sessionView(db, user, p.id);
+  if (item.skipped_at)
+    fail(
+      409,
+      "This card was updated in another session or is now unavailable.",
+    );
   const grade = json<GradeResult | null>(item.grade);
   if (!grade || grade.requiresManual || grade.correct === null)
     throw new ServiceError(400, "Answer and grade the question first");
-  const current = (await sessionItems(db, p.id)).find(
-    (i) => !finished(session, i),
-  );
+  const current = currentSessionItem(session, items);
   if (current?.id !== item.id) fail(409, "Rate the current question first");
   const schedule =
     (await one<any>(
@@ -1083,10 +1147,7 @@ async function rateSession(db: Database, user: string, p: any) {
     )) ?? fail(409, "This card is no longer introduced");
   if (schedule.suspended) fail(409, "This card is suspended");
   if (schedule.version !== item.schedule_version)
-    fail(
-      409,
-      "This card was reviewed or reset in another session. Start a fresh session to use its current schedule.",
-    );
+    fail(409, "This card was reviewed or reset in another session.");
   const course = await ownedCourse(db, user, session.course_id);
   if (course.archived && course.archive_mode === "paused")
     fail(409, "Scheduled reviews are paused for this course");
@@ -1102,7 +1163,9 @@ async function rateSession(db: Database, user: string, p: any) {
   const statements = [
     stmt(
       db,
-      "INSERT INTO reviews(id,user_id,card_id,session_item_id,rating,correct,before,after,log,grade,response_ms,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,? FROM schedules WHERE card_id=? AND version=? AND suspended=0",
+      `INSERT INTO reviews(id,user_id,card_id,session_item_id,rating,correct,before,after,log,grade,response_ms,created_at)
+       SELECT ?,?,?,?,?,?,?,?,?,?,?,? FROM schedules WHERE card_id=? AND version=? AND suspended=0
+       AND EXISTS (SELECT 1 FROM session_items i WHERE i.id=? AND ${canWriteSessionItem})`,
       eventId,
       user,
       item.card_id,
@@ -1117,6 +1180,7 @@ async function rateSession(db: Database, user: string, p: any) {
       time,
       item.card_id,
       item.schedule_version,
+      item.id,
     ),
     stmt(
       db,
@@ -1148,10 +1212,15 @@ async function rateSession(db: Database, user: string, p: any) {
   if (
     !(await one(db, "SELECT id FROM reviews WHERE session_item_id=?", item.id))
   )
-    fail(409, "Another review updated this card. Start a fresh session.");
+    fail(409, "This card changed while the rating was being saved.");
   return sessionView(db, user, p.id);
 }
-async function sessionsList(db: Database, user: string, p: any) {
+async function sessionsList(
+  db: Database,
+  user: string,
+  p: { courseId?: string; limit: number },
+  resumableOnly = false,
+) {
   const args: any[] = [user];
   let filter = "s.user_id=?";
   if (p.courseId) {
@@ -1159,9 +1228,23 @@ async function sessionsList(db: Database, user: string, p: any) {
     filter += " AND s.course_id=?";
     args.push(p.courseId);
   }
+  if (resumableOnly)
+    filter +=
+      " AND s.status='active' AND NOT (s.mode='review' AND c.archived=1 AND c.archive_mode='paused')";
   return rows<any>(
     db,
-    `SELECT s.id,s.course_id AS courseId,c.name AS courseName,s.mode,s.status,s.created_at AS createdAt,s.completed_at AS completedAt,COUNT(i.id) AS total,SUM(CASE WHEN i.answered_at IS NOT NULL AND json_extract(i.grade,'$.correct') IS NOT NULL THEN 1 ELSE 0 END) AS answered,SUM(CASE WHEN json_extract(i.grade,'$.correct')=1 THEN 1 ELSE 0 END) AS correct,AVG(CASE WHEN json_extract(i.grade,'$.correct') IS NOT NULL THEN json_extract(i.grade,'$.correct') END) AS accuracy,COALESCE(SUM(i.response_ms),0) AS responseMs FROM sessions s JOIN courses c ON c.id=s.course_id LEFT JOIN session_items i ON i.session_id=s.id WHERE ${filter} GROUP BY s.id ORDER BY s.created_at DESC LIMIT ?`,
+    `SELECT s.id,s.course_id AS courseId,c.name AS courseName,s.mode,s.status,
+       s.created_at AS createdAt,s.completed_at AS completedAt,
+       COUNT(CASE WHEN (${finishedSessionItem}) OR NOT (${unavailableSessionItem}) THEN i.id END) AS total,
+       COUNT(CASE WHEN ${finishedSessionItem} THEN 1 END) AS answered,
+       COUNT(CASE WHEN ${finishedSessionItem} AND json_extract(i.grade,'$.correct')=1 THEN 1 END) AS correct,
+       AVG(CASE WHEN ${finishedSessionItem} THEN json_extract(i.grade,'$.correct') END) AS accuracy,
+       SUM(CASE WHEN ${finishedSessionItem} THEN i.response_ms ELSE 0 END) AS responseMs
+     FROM sessions s JOIN courses c ON c.id=s.course_id
+     LEFT JOIN session_items i ON i.session_id=s.id AND i.skipped_at IS NULL
+     LEFT JOIN schedules sch ON sch.card_id=i.card_id
+     WHERE ${filter} GROUP BY s.id ${resumableOnly ? "HAVING total > answered" : ""}
+     ORDER BY s.created_at DESC,s.id DESC LIMIT ?`,
     ...args,
     p.limit,
   );
@@ -1173,7 +1256,7 @@ async function analytics(db: Database, user: string, p: any) {
     user,
     new Date(Date.now() - p.days * 86400000).toISOString(),
   ];
-  let filter = "s.user_id=? AND i.answered_at>=?";
+  let filter = "s.user_id=? AND i.answered_at>=? AND i.skipped_at IS NULL";
   if (p.courseId) {
     filter += " AND s.course_id=?";
     args.push(p.courseId);
@@ -1197,7 +1280,7 @@ async function analytics(db: Database, user: string, p: any) {
   );
   const valid = events.filter(
       (e) =>
-        json<GradeResult | null>(e.grade)?.correct !== null &&
+        json<GradeResult | null>(e.grade)?.correct != null &&
         (e.mode !== "review" || e.reviewed_at),
     ),
     review = valid.filter((e) => e.mode === "review"),
@@ -1424,6 +1507,7 @@ const tableColumns: Record<string, string[]> = {
     "answered_at",
     "rating",
     "reviewed_at",
+    "skipped_at",
   ],
   reviews: [
     "id",
@@ -1523,6 +1607,7 @@ const nullableColumns = new Set([
   "answered_at",
   "rating",
   "reviewed_at",
+  "skipped_at",
 ]);
 const numericColumns = new Set([
   "is_math",
@@ -1677,6 +1762,7 @@ function validateRowJson(table: string, row: any) {
     "due",
     "answered_at",
     "reviewed_at",
+    "skipped_at",
     "completed_at",
   ])
     if (row[key] !== undefined && row[key] !== null) backupDate.parse(row[key]);
@@ -1780,6 +1866,8 @@ function validateBackup(value: unknown) {
       nextPosition.set(courseId, position + 1);
     }
   }
+  for (const row of parsed.tables.session_items)
+    if (!Object.hasOwn(row, "skipped_at")) row.skipped_at = null;
   let rowCount = 0;
   for (const table of backupTables) {
     for (const row of parsed.tables[table]) {
@@ -2007,11 +2095,13 @@ export async function execute(
       return settings;
     }
     case "dashboard": {
-      const [courses, analysis, recentSessions] = await Promise.all([
-        coursesList(db, user, false),
-        analytics(db, user, { days: 30 }),
-        sessionsList(db, user, { limit: 8 }),
-      ]);
+      const [courses, analysis, recentSessions, [resumeSession]] =
+        await Promise.all([
+          coursesList(db, user, false),
+          analytics(db, user, { days: 30 }),
+          sessionsList(db, user, { limit: 8 }),
+          sessionsList(db, user, { limit: 1 }, true),
+        ]);
       const preferences = await getSettings(db, user);
       const today = new Intl.DateTimeFormat("en-CA", {
         timeZone: preferences.timezone,
@@ -2028,6 +2118,7 @@ export async function execute(
             analysis.trend.find((day) => day.date === today)?.reviews ?? 0,
         },
         recentSessions,
+        resumeSession: resumeSession ?? null,
         trend: analysis.trend,
         weakSkills: analysis.weakSkills,
       };
@@ -2071,7 +2162,7 @@ export async function execute(
         ),
       );
       await db.batch(statements);
-      return (await courseDetail(db, user, courseId)).course;
+      return courseSummary(db, user, await ownedCourse(db, user, courseId));
     }
     case "courses.update": {
       await ownedCourse(db, user, p.id);
@@ -2096,7 +2187,7 @@ export async function execute(
           p.id,
           user,
         );
-      return (await courseDetail(db, user, p.id)).course;
+      return courseSummary(db, user, await ownedCourse(db, user, p.id));
     }
     case "units.create": {
       await ownedCourse(db, user, p.courseId);
@@ -2173,15 +2264,14 @@ export async function execute(
         fail(404, "One or more cards were not found");
       if (found.some((c) => !c.card_id))
         fail(400, "Introduce cards before activating or suspending them");
-      await db.batch(
-        ids.map((cardId) =>
-          stmt(
-            db,
-            "UPDATE schedules SET suspended=? WHERE card_id=?",
-            Number(p.status === "suspended"),
-            cardId,
-          ),
-        ),
+      const suspended = Number(p.status === "suspended");
+      await run(
+        db,
+        `UPDATE schedules SET suspended=?,version=version+1
+         WHERE suspended<>? AND card_id IN (SELECT value FROM json_each(?))`,
+        suspended,
+        suspended,
+        JSON.stringify(ids),
       );
       return { updated: ids.length, status: p.status };
     }

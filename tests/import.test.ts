@@ -674,7 +674,11 @@ describe("import routing, study, and durability", () => {
         isMath: true,
         units: ["Original"],
       });
-      const { units } = await oldCall("courses.get", { id: c.id });
+      const [unit] = await rows<{ id: string }>(
+        legacyDb,
+        "SELECT id FROM units WHERE course_id=?",
+        c.id,
+      );
       const date = new Date().toISOString();
       for (const id of ["old-b", "old-a"])
         await run(
@@ -682,13 +686,14 @@ describe("import routing, study, and durability", () => {
           "INSERT INTO problems (id,course_id,unit_id,external_id,content,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
           id,
           c.id,
-          units[0].id,
+          unit.id,
           id,
           JSON.stringify(question),
           date,
           date,
         );
-      legacyDb.exec(readFileSync(`drizzle/${files[2]}`, "utf8"));
+      for (const file of files.slice(2))
+        legacyDb.exec(readFileSync(`drizzle/${file}`, "utf8"));
       await oldCall("library.import", {
         courseId: c.id,
         unitName: "Original",
@@ -696,7 +701,7 @@ describe("import routing, study, and durability", () => {
       });
       const list = await oldCall("problems.list", {
         courseId: c.id,
-        unitId: units[0].id,
+        unitId: unit.id,
       });
       expect(
         list.items.map((item: any) => [item.externalId, item.position]),

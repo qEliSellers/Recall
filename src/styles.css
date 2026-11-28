@@ -1467,6 +1467,13 @@ small {
   text-decoration: underline;
   color: var(--muted);
 }
+.review-availability p {
+  color: var(--muted);
+  margin: 0 0 8px;
+}
+.course-resume {
+  margin-bottom: 20px;
+}
 .mode-options {
   display: grid;
   gap: 9px;

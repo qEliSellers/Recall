@@ -112,6 +112,8 @@ Every question has a `type` and a nonempty `prompt`. These shared fields are opt
 
 Prompts and explanations are limited to 20,000 characters. Images have a 2,000-character URL limit and 500-character alternative-text limit. Question objects are strict: unknown fields are rejected instead of silently ignored.
 
+Write inline formulas as `$x + 2$` with the delimiters tight to the formula. Use `$$x + 2$$` for display math. Ordinary prices such as `$12 and $3` can be written as text. To make a currency sign explicit next to a formula, write `\$`; in a JSON string, encode it as `"\\$12"`.
+
 A variant is `{ "id": "alternate", "prompt": "An alternate version of the prompt" }`. It may include `componentPrompts`, a map from source IDs to alternate prompts. Use the blank IDs for cloze, pair IDs for matching, or `main` for choice questions. Sequencing and typed questions support top-level prompt variants. At most 30 variants are accepted, and variant IDs must be unique. Keep the same answer meaning across variants. The selected variant and presentation are saved with each attempt.
 
 ### Single-choice and true/false

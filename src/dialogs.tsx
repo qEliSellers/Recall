@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   BookOpen,
   Search,
@@ -12,8 +12,14 @@ import {
   Info,
 } from "lucide-react";
 import { ACELLUS_COURSES, ACELLUS_CATALOG_URL } from "../lib/catalog";
-import { api, type Course, type Unit } from "./api";
+import { api, ApiRequestError, type Course, type Unit } from "./api";
 import { Modal, ErrorNotice } from "./ui";
+import {
+  countReviews,
+  reviewNotice,
+  useReviewsDue,
+  type ReviewAction,
+} from "./review-availability";
 export function CreateCourse({
   onClose,
   onCreated,
@@ -220,16 +226,20 @@ export function SessionSetup({
   course,
   units: providedUnits,
   initialMode = "review",
+  initialEarly = false,
+  onReviewAction,
   onClose,
   onStarted,
 }: {
   course: Course;
   units?: Unit[];
   initialMode?: "review" | "quiz" | "problem";
+  initialEarly?: boolean;
+  onReviewAction: (action: ReviewAction, units: Unit[]) => void;
   onClose: () => void;
   onStarted: (id: string) => void;
 }) {
-  const [units, setUnits] = useState(providedUnits || []),
+  const [latest, setLatest] = useState<{ course: Course; units: Unit[] }>(),
     [mode, setMode] = useState(initialMode),
     [scope, setScope] = useState("course"),
     [unitId, setUnitId] = useState(""),
@@ -237,18 +247,58 @@ export function SessionSetup({
     [selection, setSelection] = useState("random"),
     [feedback, setFeedback] = useState("immediate"),
     [include, setInclude] = useState(false),
-    [early, setEarly] = useState(false),
+    [early, setEarly] = useState(initialEarly),
     [skill, setSkill] = useState(""),
     [busy, setBusy] = useState(false),
     [error, setError] = useState("");
+  const saving = useRef(false);
   useEffect(() => {
-    if (!providedUnits)
-      api("courses.get", { id: course.id })
-        .then((d) => setUnits(d.units))
-        .catch((e) => setError(e.message));
-  }, []);
+    let live = true;
+    api("courses.get", { id: course.id })
+      .then((d) => live && setLatest(d))
+      .catch((e) => {
+        if (live && !providedUnits) setError(e.message);
+      });
+    return () => {
+      live = false;
+    };
+  }, [course.id, providedUnits]);
+  useEffect(() => setError(""), [mode, scope, unitId, early, include]);
+  const currentCourse = latest?.course ?? course;
+  const units = latest?.units ?? providedUnits ?? [];
+  const boundary = units.findIndex(
+    (unit) => unit.id === currentCourse.midtermUnitId,
+  );
+  const scopedUnits =
+    scope === "course"
+      ? units
+      : scope === "midterm"
+        ? units.slice(0, boundary + 1)
+        : units.filter((unit) => unit.id === unitId);
+  const counts =
+    scope === "course"
+      ? currentCourse
+      : scopedUnits.length
+        ? countReviews(scopedUnits)
+        : undefined;
+  const due = useReviewsDue(counts);
+  const paused =
+    currentCourse.archived && currentCourse.archiveMode === "paused";
+  const canReviewEarly = Boolean(counts?.activeCards) && !paused;
+  const canReview =
+    Boolean(counts) && !paused && (due || (early && canReviewEarly));
+  const notice =
+    mode === "review" && counts && (paused || !due)
+      ? reviewNotice(
+          counts,
+          scopedUnits.length > 0 || Boolean(currentCourse.unitCount),
+          paused,
+        )
+      : null;
   async function submit(e: React.FormEvent) {
     e.preventDefault();
+    if (saving.current || (mode === "review" && !canReview)) return;
+    saving.current = true;
     setBusy(true);
     setError("");
     try {
@@ -258,25 +308,44 @@ export function SessionSetup({
         scope,
         unitId: scope === "unit" ? unitId : undefined,
         count,
-        selection,
-        feedback,
-        includeUnintroduced: include,
-        early,
-        skill: skill || undefined,
+        selection: mode === "review" ? "random" : selection,
+        feedback: mode === "review" ? "immediate" : feedback,
+        includeUnintroduced: mode === "quiz" && include,
+        early: mode === "review" && early,
+        skill: mode === "review" ? undefined : skill || undefined,
       });
       onStarted(session.id);
-    } catch (e: any) {
-      setError(e.message);
+    } catch (e) {
+      if (
+        mode === "review" &&
+        e instanceof ApiRequestError &&
+        e.status === 400
+      ) {
+        const updated = await api("courses.get", { id: course.id }).catch(
+          () => null,
+        );
+        if (updated) setLatest(updated);
+      }
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
+      saving.current = false;
       setBusy(false);
     }
   }
   return (
-    <Modal title="Find your focus" subtitle={course.name} onClose={onClose}>
-      <form onSubmit={submit}>
+    <Modal
+      title="Find your focus"
+      subtitle={course.name}
+      onClose={() => {
+        if (!saving.current) onClose();
+      }}
+    >
+      <form onSubmit={submit} aria-busy={busy}>
         <div className="mode-options">
           <button
             type="button"
+            disabled={busy}
+            aria-pressed={mode === "review"}
             className={`mode-option ${mode === "review" ? "selected" : ""}`}
             onClick={() => setMode("review")}
           >
@@ -288,6 +357,8 @@ export function SessionSetup({
           </button>
           <button
             type="button"
+            disabled={busy}
+            aria-pressed={mode === "quiz"}
             className={`mode-option ${mode === "quiz" ? "selected" : ""}`}
             onClick={() => setMode("quiz")}
           >
@@ -298,6 +369,8 @@ export function SessionSetup({
           {course.isMath && (
             <button
               type="button"
+              disabled={busy}
+              aria-pressed={mode === "problem"}
               className={`mode-option ${mode === "problem" ? "selected" : ""}`}
               onClick={() => setMode("problem")}
             >
@@ -310,12 +383,16 @@ export function SessionSetup({
         <div className="form-stack">
           <label className="form-field">
             Study scope
-            <select value={scope} onChange={(e) => setScope(e.target.value)}>
+            <select
+              disabled={busy}
+              value={scope}
+              onChange={(e) => setScope(e.target.value)}
+            >
               <option value="course">Entire course</option>
               <option value="unit">One unit</option>
-              <option value="midterm" disabled={!course.midtermUnitId}>
+              <option value="midterm" disabled={!currentCourse.midtermUnitId}>
                 Before the midterm
-                {!course.midtermUnitId ? " · set boundary first" : ""}
+                {!currentCourse.midtermUnitId ? " · set boundary first" : ""}
               </option>
             </select>
           </label>
@@ -323,6 +400,7 @@ export function SessionSetup({
             <label className="form-field">
               Unit
               <select
+                disabled={busy}
                 required
                 value={unitId}
                 onChange={(e) => setUnitId(e.target.value)}
@@ -340,6 +418,7 @@ export function SessionSetup({
             <label className="form-field">
               {mode === "review" ? "Session limit" : "Questions"}
               <input
+                disabled={busy}
                 type="number"
                 min={1}
                 max={300}
@@ -352,6 +431,7 @@ export function SessionSetup({
               <label className="form-field">
                 Selection
                 <select
+                  disabled={busy}
                   value={selection}
                   onChange={(e) => setSelection(e.target.value)}
                 >
@@ -369,6 +449,7 @@ export function SessionSetup({
                 {[10, 20, 50, 100, 300].map((n) => (
                   <button
                     type="button"
+                    disabled={busy}
                     className={count === n ? "selected" : ""}
                     key={n}
                     onClick={() => setCount(n)}
@@ -380,6 +461,7 @@ export function SessionSetup({
               <label className="form-field">
                 Feedback
                 <select
+                  disabled={busy}
                   value={feedback}
                   onChange={(e) => setFeedback(e.target.value)}
                 >
@@ -390,6 +472,7 @@ export function SessionSetup({
               <label className="form-field">
                 Skill filter <span className="muted">Optional</span>
                 <input
+                  disabled={busy}
                   value={skill}
                   onChange={(e) => setSkill(e.target.value)}
                   placeholder="e.g. linear-equations"
@@ -400,6 +483,7 @@ export function SessionSetup({
           {mode === "quiz" && (
             <label className="check-label">
               <input
+                disabled={busy}
                 type="checkbox"
                 checked={include}
                 onChange={(e) => setInclude(e.target.checked)}
@@ -410,9 +494,10 @@ export function SessionSetup({
               </span>
             </label>
           )}
-          {mode === "review" && (
+          {mode === "review" && canReviewEarly && (
             <label className="check-label">
               <input
+                disabled={busy}
                 type="checkbox"
                 checked={early}
                 onChange={(e) => setEarly(e.target.checked)}
@@ -425,13 +510,36 @@ export function SessionSetup({
               </span>
             </label>
           )}
+          {notice && (
+            <div className="review-availability">
+              <p role="status">{notice.message}</p>
+              {notice.action && (
+                <button
+                  type="button"
+                  disabled={busy}
+                  className="button secondary"
+                  onClick={() => onReviewAction(notice.action!, scopedUnits)}
+                >
+                  {notice.label}
+                </button>
+              )}
+            </div>
+          )}
         </div>
         <ErrorNotice message={error} />
         <div className="modal-actions">
-          <button type="button" className="button secondary" onClick={onClose}>
+          <button
+            type="button"
+            className="button secondary"
+            onClick={onClose}
+            disabled={busy}
+          >
             Cancel
           </button>
-          <button className="button primary" disabled={busy}>
+          <button
+            className="button primary"
+            disabled={busy || (mode === "review" && !canReview)}
+          >
             {busy ? "Preparing…" : "Begin session"}
             <ArrowRight size={16} />
           </button>

@@ -750,7 +750,8 @@ function Editor({
                   placeholder="What do you want to remember?"
                 />
                 <small>
-                  Use $…$ for inline math and $$…$$ for display math.
+                  Use $…$ for inline math and $$…$$ for display math. Use{" "}
+                  {"\\$"} to mark a literal dollar sign next to a formula.
                 </small>
               </label>
               {content.type === "typed" ? (

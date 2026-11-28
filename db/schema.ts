@@ -143,6 +143,7 @@ export const sessionItems = sqliteTable(
     answeredAt: text("answered_at"),
     rating: integer("rating"),
     reviewedAt: text("reviewed_at"),
+    skippedAt: text("skipped_at"),
   },
   (t) => [uniqueIndex("session_item_position").on(t.sessionId, t.position)],
 );

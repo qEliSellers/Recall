@@ -90,6 +90,12 @@ try {
     count: 1,
   });
   const item = session.current;
+  const overlapping = await action("sessions.create", {
+    courseId: course.id,
+    mode: "review",
+    count: 2,
+  });
+  assert.equal(overlapping.current.cardId, item.cardId);
   assert.ok(!JSON.stringify(session).includes("correctOptionIds"));
   const choice = item.question.components[0].options.find(
     (option) => option.text === "4",
@@ -106,6 +112,11 @@ try {
     (await action("history.reviews", { courseId: course.id })).total,
     1,
   );
+  const resumed = await action("sessions.get", { id: overlapping.id });
+  assert.equal(resumed.skipped, 1);
+  assert.equal(resumed.total, 1);
+  assert.notEqual(resumed.current.cardId, item.cardId);
+  assert.equal((await action("dashboard")).resumeSession.id, overlapping.id);
   const before = await db
     .prepare("SELECT * FROM schedules ORDER BY card_id")
     .all();
@@ -114,6 +125,7 @@ try {
     mode: "quiz",
     count: 300,
     includeUnintroduced: true,
+    selection: "ordered",
   });
   assert.equal(quiz.total, 100);
   assert.deepEqual(
@@ -121,6 +133,11 @@ try {
       .results,
     before.results,
   );
+  assert.equal(quiz.current.cardId, item.cardId);
+  await action("cards.status", { ids: [item.cardId], status: "suspended" });
+  const resumedQuiz = await action("sessions.get", { id: quiz.id });
+  assert.equal(resumedQuiz.skipped, 1);
+  assert.equal(resumedQuiz.total, 99);
   const bulkCourse = await action("courses.create", {
     name: "Synthetic maximum-size mixed import",
     isMath: true,
@@ -241,8 +258,9 @@ try {
     (await action("history.reviews", { courseId: course.id })).total,
     1,
   );
+  assert.equal((await action("sessions.get", { id: quiz.id })).skipped, 1);
   console.log(
-    "Worker smoke passed: built assets, auth, D1 migrations, ordered 1,000-item mixed import, introduction, atomic FSRS, quiz isolation, R2 media, and complete backup restore.",
+    "Worker smoke passed: built assets, auth, D1 migrations, ordered 1,000-item mixed import, introduction, atomic FSRS, review and quiz resumption, R2 media, and complete backup restore.",
   );
 } finally {
   await runtime.dispose();
