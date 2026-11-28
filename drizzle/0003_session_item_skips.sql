@@ -1,0 +1,1 @@
+ALTER TABLE `session_items` ADD `skipped_at` text;

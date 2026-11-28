@@ -17,52 +17,80 @@ import {
   Flag,
   PenLine,
 } from "lucide-react";
-import { api, number, percent, type Course, type Unit } from "./api";
+import {
+  api,
+  number,
+  percent,
+  resumeLabel,
+  type Course,
+  type SessionSummary,
+  type Unit,
+} from "./api";
 import { Modal, Empty, Loading, ErrorNotice, Stat } from "./ui";
 import { SessionSetup } from "./dialogs";
 import CardLibrary from "./CardLibrary";
 import Statistics from "./Statistics";
+import {
+  reviewNotice,
+  useReviewsDue,
+  type ReviewAction,
+} from "./review-availability";
 export default function CourseDetail({
   id,
+  initialTab = "study",
   revision,
   refresh,
   onSession,
 }: {
   id: string;
+  initialTab?: "study" | "units" | "cards";
   revision: number;
   refresh: () => void;
   onSession: (id: string) => void;
 }) {
   const [course, setCourse] = useState<Course | null>(null),
     [units, setUnits] = useState<Unit[]>([]),
-    [tab, setTab] = useState("study"),
+    [tab, setTab] = useState<string>(initialTab),
+    [resume, setResume] = useState<SessionSummary | null>(null),
     [error, setError] = useState(""),
     [loading, setLoading] = useState(true),
     [settings, setSettings] = useState(false),
     [newUnit, setNewUnit] = useState(false),
     [study, setStudy] = useState<"review" | "quiz" | "problem" | null>(null),
     [introduce, setIntroduce] = useState<Unit | null>(null);
-  const load = () =>
-    api("courses.get", { id })
+  useEffect(() => setTab(initialTab), [initialTab]);
+  useEffect(() => {
+    let live = true;
+    api<{
+      course: Course;
+      units: Unit[];
+      resumeSession: SessionSummary | null;
+    }>("courses.get", { id })
       .then((d) => {
+        if (!live) return;
         setCourse(d.course);
         setUnits(d.units);
+        setResume(d.resumeSession);
         setError("");
       })
-      .catch((e) => setError(e.message))
-      .finally(() => setLoading(false));
-  useEffect(() => {
-    setLoading(true);
-    setTab("study");
-    load();
-  }, [id]);
-  useEffect(() => {
-    load();
-  }, [revision]);
-  const changed = () => {
-    load();
-    refresh();
-  };
+      .catch((e) => live && setError(e.message))
+      .finally(() => live && setLoading(false));
+    return () => {
+      live = false;
+    };
+  }, [id, revision]);
+  const changed = refresh;
+  const reviewsDue = useReviewsDue(course ?? undefined);
+  function onReviewAction(action: ReviewAction, scopedUnits = units) {
+    setStudy(null);
+    if (action === "introduce") {
+      const waiting = scopedUnits.filter((unit) => unit.unintroducedCards);
+      if (waiting.length === 1) setIntroduce(waiting[0]);
+      else setTab("units");
+    } else if (action === "library") setTab("cards");
+    else if (action === "add-unit") setNewUnit(true);
+    else setSettings(true);
+  }
   async function reorder(index: number, direction: number) {
     const next = [...units];
     [next[index], next[index + direction]] = [
@@ -81,6 +109,11 @@ export default function CourseDetail({
   }
   if (loading) return <Loading />;
   if (!course) return <ErrorNotice message={error || "Course not found."} />;
+  const reviewsPaused = course.archived && course.archiveMode === "paused";
+  const emptyReview =
+    reviewsPaused || !reviewsDue
+      ? reviewNotice(course, units.length > 0, reviewsPaused)
+      : null;
   return (
     <>
       <a
@@ -155,6 +188,16 @@ export default function CourseDetail({
         </button>
       </div>
       <ErrorNotice message={error} />
+      {resume && (
+        <button
+          className="button secondary course-resume"
+          onClick={() => onSession(resume.id)}
+        >
+          <Play size={15} />
+          {resumeLabel(resume.mode)} · {resume.answered} of {resume.total}{" "}
+          complete
+        </button>
+      )}
       {tab === "study" ? (
         <>
           <div className="stats-grid">
@@ -192,23 +235,29 @@ export default function CourseDetail({
               <span className="eyebrow">REMEMBER FOR LONGER</span>
               <h2>{course.isMath ? "Concept Review" : "Scheduled Review"}</h2>
               <p>
-                Review the right material at the right time. Standard FSRS
-                adapts to how well you remember.
+                {emptyReview?.message ??
+                  "Review cards that are due. FSRS adapts to how well you remember."}
               </p>
-              <button
-                className="button primary"
-                disabled={course.archived && course.archiveMode === "paused"}
-                onClick={() => setStudy("review")}
-              >
-                <Play size={15} />
-                Start review
-                <ArrowRight size={16} />
-              </button>
-              {course.archived && course.archiveMode === "paused" && (
-                <small className="muted">
-                  Reviews are paused. Change archive settings to resume.
-                </small>
-              )}
+              <div className="button-row">
+                {emptyReview?.action && (
+                  <button
+                    className="button primary"
+                    onClick={() => onReviewAction(emptyReview.action!)}
+                  >
+                    {emptyReview.label}
+                  </button>
+                )}
+                {!reviewsPaused &&
+                  (reviewsDue || Boolean(course.activeCards)) && (
+                    <button
+                      className={`button ${emptyReview?.action ? "secondary" : "primary"}`}
+                      onClick={() => setStudy("review")}
+                    >
+                      <Play size={15} />
+                      {reviewsDue ? "Start review" : "Review early"}
+                    </button>
+                  )}
+              </div>
             </section>
             <section className="panel study-choice">
               <span className="study-choice-icon amber">
@@ -426,6 +475,8 @@ export default function CourseDetail({
           course={course}
           units={units}
           initialMode={study}
+          initialEarly={study === "review" && !reviewsDue}
+          onReviewAction={onReviewAction}
           onClose={() => setStudy(null)}
           onStarted={onSession}
         />
@@ -478,7 +529,7 @@ function NewUnit({
             value={name}
             maxLength={200}
             onChange={(e) => setName(e.target.value)}
-            placeholder="e.g. Foundations of algebra"
+            placeholder="e.g. Core concepts"
           />
         </label>
         <ErrorNotice message={error} />
@@ -547,7 +598,11 @@ export function Introduce({
             Cancel
           </button>
           <button className="button primary" disabled={busy}>
-            {busy ? "Introducing…" : `Introduce ${count} cards`}
+            {busy
+              ? "Introducing…"
+              : count === 1
+                ? "Introduce 1 card"
+                : `Introduce ${count} cards`}
             <Plus size={16} />
           </button>
         </div>

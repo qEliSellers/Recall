@@ -1,4 +1,8 @@
-import { useEffect, useState } from "react";
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  useEffect,
+  useState,
+} from "react";
 import {
   ArrowDown,
   ArrowUp,
@@ -13,6 +17,61 @@ import type {
   PresentedComponent,
 } from "../lib/types";
 
+const inlineBody = (formula: string) =>
+  formula.length > 0 && formula.trim() === formula && !/[\r\n]/.test(formula);
+const priceBeforeProse =
+  /^[+−-]?\p{Nd}+(?:[.,\u00a0\u202f]\p{Nd}+)*[\s,.!?;:—–)"'’”\]]+\p{L}{2}/u;
+
+function splitMath(text: string) {
+  const dollars = Array.from(text.matchAll(/(\\*)(\$+)/g)).flatMap((match) => {
+    const escaped = match[1].length % 2;
+    const width = match[2].length - escaped;
+    return width === 1 || width === 2
+      ? [{ start: match.index + match[1].length + escaped, width }]
+      : [];
+  });
+  const pieces: { text: string; kind: "plain" | "inline" | "display" }[] = [];
+  const plain = (start: number, end: number) => {
+    if (end > start) {
+      pieces.push({
+        text: text
+          .slice(start, end)
+          .replace(/(\\+)\$/g, (literal, slashes: string) =>
+            slashes.length % 2 ? slashes.slice(1) + "$" : literal,
+          ),
+        kind: "plain",
+      });
+    }
+  };
+  let read = 0;
+  for (let i = 0; i < dollars.length - 1; i++) {
+    const open = dollars[i],
+      close = dollars[i + 1],
+      following = dollars[i + 2];
+    if (open.width !== close.width) continue;
+    const display = open.width === 2;
+    const end = close.start + close.width;
+    const formula = text.slice(open.start + open.width, close.start);
+    // A price in prose must not consume the opener of an adjacent formula.
+    const adjacentFormula =
+      following?.width === 1 && inlineBody(text.slice(end, following.start));
+    if (
+      display
+        ? !formula.trim()
+        : !inlineBody(formula) ||
+          /^\p{Nd}/u.test(text.slice(end)) ||
+          (priceBeforeProse.test(formula) && adjacentFormula)
+    )
+      continue;
+    plain(read, open.start);
+    pieces.push({ text: formula, kind: display ? "display" : "inline" });
+    read = end;
+    i++;
+  }
+  plain(read, text.length);
+  return pieces;
+}
+
 export function MathText({
   text,
   className = "",
@@ -20,23 +79,20 @@ export function MathText({
   text: string;
   className?: string;
 }) {
-  const chunks = text.split(/(\$\$[\s\S]+?\$\$|\$[^\n$]+?\$)/g);
   return (
     <span className={className}>
-      {chunks.map((chunk, index) => {
-        if (!chunk.startsWith("$") || !chunk.endsWith("$") || chunk.length < 3)
-          return <span key={index}>{chunk}</span>;
-        const display = chunk.startsWith("$$");
-        const formula = chunk.slice(display ? 2 : 1, display ? -2 : -1);
+      {splitMath(text).map(({ text: chunk, kind }, index) => {
+        if (kind === "plain") return <span key={index}>{chunk}</span>;
+        const display = kind === "display";
         try {
           return (
             <span
               className={display ? "math-block" : "math-inline"}
               key={index}
               dangerouslySetInnerHTML={{
-                __html: katex.renderToString(formula, {
+                __html: katex.renderToString(chunk, {
                   displayMode: display,
-                  throwOnError: false,
+                  throwOnError: true,
                   trust: false,
                   strict: "warn",
                   maxExpand: 200,
@@ -46,7 +102,8 @@ export function MathText({
             />
           );
         } catch {
-          return <span key={index}>{chunk}</span>;
+          const delimiter = display ? "$$" : "$";
+          return <span key={index}>{delimiter + chunk + delimiter}</span>;
         }
       })}
     </span>
@@ -110,6 +167,27 @@ export function QuestionView({
           : [...selected, optionId],
       };
     });
+  };
+  const moveRadio = (
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+    part: PresentedComponent,
+    index: number,
+  ) => {
+    if (part.kind !== "single" || !part.options || busy) return;
+    const direction =
+      event.key === "ArrowRight" || event.key === "ArrowDown"
+        ? 1
+        : event.key === "ArrowLeft" || event.key === "ArrowUp"
+          ? -1
+          : 0;
+    if (!direction) return;
+    event.preventDefault();
+    const next =
+      (index + direction + part.options.length) % part.options.length;
+    select(part, part.options[next].id);
+    event.currentTarget.parentElement
+      ?.querySelectorAll<HTMLButtonElement>('[role="radio"]')
+      [next]?.focus();
   };
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
@@ -224,9 +302,16 @@ export function QuestionView({
                       type="button"
                       role={part.kind === "single" ? "radio" : "checkbox"}
                       aria-checked={selected}
+                      tabIndex={
+                        part.kind === "single" &&
+                        !(selected || (!answers[part.id] && index === 0))
+                          ? -1
+                          : undefined
+                      }
                       className={`answer-option ${selected ? "selected" : ""}`}
                       key={option.id}
                       onClick={() => select(part, option.id)}
+                      onKeyDown={(event) => moveRadio(event, part, index)}
                     >
                       <span className="option-key">
                         {index < 9

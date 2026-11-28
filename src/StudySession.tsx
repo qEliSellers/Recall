@@ -18,7 +18,7 @@ import type {
   QuestionPresentation,
   QuestionResponse,
 } from "../lib/types";
-import { api } from "./api";
+import { api, ApiRequestError } from "./api";
 import { MathText, QuestionView } from "./QuestionView";
 
 type SessionItem = {
@@ -63,6 +63,8 @@ type SessionView = {
   total: number;
   answered: number;
   index: number;
+  skipped?: number;
+  paused?: boolean;
   current?: SessionItem;
   lastAnswer?: AnswerFeedback;
   createdAt?: string;
@@ -287,15 +289,14 @@ function SessionResults({
   const [onlyMissed, setOnlyMissed] = useState(false);
   const [openResult, setOpenResult] = useState<string | null>(null);
   const results = view.results;
-  if (!results)
+  if (!results?.total)
     return (
       <div className="panel study-empty">
         <CheckCircle2 size={32} />
-        <h2>Session complete</h2>
-        <p className="muted">Your progress has been saved.</p>
-        <button className="button primary" onClick={onClose}>
-          Back to your course
-        </button>
+        <h2>No questions remain in this session</h2>
+        <a className="button primary" href={`#/course/${view.courseId}`}>
+          Open course
+        </a>
       </div>
     );
   const missed = results.items.filter((item) => item.grade.correct === false);
@@ -360,7 +361,7 @@ function SessionResults({
               </button>
             )}
             <button className="button secondary" onClick={onClose}>
-              Back to your course <ArrowRight size={16} />
+              Back to overview <ArrowRight size={16} />
             </button>
           </div>
         </div>
@@ -486,16 +487,19 @@ export function StudySession({
   sessionId,
   onClose,
   onChanged,
+  onSessionChange,
 }: {
   sessionId: string;
   onClose: () => void;
   onChanged?: () => void;
+  onSessionChange?: (id: string) => void;
 }) {
   const [activeId, setActiveId] = useState(sessionId);
   const [view, setView] = useState<SessionView | null>(null);
   const [feedback, setFeedback] = useState<AnswerFeedback | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const [showHint, setShowHint] = useState(false);
   const startedAt = useRef(Date.now());
   const lastResponse = useRef<QuestionResponse | null>(null);
@@ -522,12 +526,31 @@ export function StudySession({
     return () => {
       cancelled = true;
     };
-  }, [activeId]);
+  }, [activeId, loadAttempt]);
   useEffect(() => {
     startedAt.current = Date.now();
     setShowHint(false);
     lastResponse.current = null;
   }, [view?.current?.id]);
+  const saveError = async (reason: unknown) => {
+    if (reason instanceof ApiRequestError && reason.status === 409) {
+      const latest = await api<SessionView>("sessions.get", {
+        id: activeId,
+      }).catch(() => null);
+      if (
+        latest &&
+        (latest.paused ||
+          latest.current?.id !== view?.current?.id ||
+          latest.current?.phaseIndex !== view?.current?.phaseIndex ||
+          latest.current?.submitted !== view?.current?.submitted)
+      ) {
+        setView(latest);
+        onChanged?.();
+        return;
+      }
+    }
+    setError(reason instanceof Error ? reason.message : String(reason));
+  };
   const submit = async (response: QuestionResponse) => {
     if (!view?.current || busy) return;
     setBusy(true);
@@ -553,7 +576,7 @@ export function StudySession({
         setFeedback(updated.lastAnswer);
       onChanged?.();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      await saveError(reason);
     } finally {
       setBusy(false);
     }
@@ -579,7 +602,7 @@ export function StudySession({
         setFeedback(updated.lastAnswer);
       onChanged?.();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      await saveError(reason);
     } finally {
       setBusy(false);
     }
@@ -598,7 +621,7 @@ export function StudySession({
       );
       onChanged?.();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      await saveError(reason);
     } finally {
       setBusy(false);
     }
@@ -621,6 +644,7 @@ export function StudySession({
         includeUnintroduced: true,
       });
       setActiveId(next.id);
+      onSessionChange?.(next.id);
       setFeedback(null);
       setView(next);
       onChanged?.();
@@ -634,13 +658,14 @@ export function StudySession({
     const key = (event: KeyboardEvent) => {
       if (
         event.key !== "Enter" ||
+        event.repeat ||
         event.altKey ||
         event.ctrlKey ||
         event.metaKey ||
         busy ||
-        (event.target as HTMLElement).tagName === "BUTTON" ||
-        (event.target as HTMLElement).tagName === "INPUT" ||
-        (event.target as HTMLElement).tagName === "TEXTAREA"
+        (event.target instanceof HTMLElement &&
+          (event.target.isContentEditable ||
+            event.target.closest("button,input,textarea,select,a")))
       )
         return;
       if (feedback) {
@@ -673,13 +698,13 @@ export function StudySession({
           <span className="status-dot" />
           {view ? modeTitle[view.mode] : "Study session"}
         </div>
-        {view && (
+        {!!view?.total && (
           <span className="muted small">
             {Math.min(view.answered, view.total)} / {view.total} complete
           </span>
         )}
       </div>
-      {view && (
+      {!!view?.total && (
         <div
           className="session-progress"
           role="progressbar"
@@ -707,6 +732,16 @@ export function StudySession({
           </button>
         </div>
       )}
+      {!!view?.skipped && (
+        <div className="study-note" role="status">
+          <p>
+            {view.skipped === 1
+              ? "1 unavailable question was skipped."
+              : `${view.skipped} unavailable questions were skipped.`}
+            {view.answered > 0 && " Your saved progress is kept."}
+          </p>
+        </div>
+      )}
       {!view && (
         <div className="panel study-empty">
           {busy ? (
@@ -717,8 +752,11 @@ export function StudySession({
           ) : (
             <>
               <p className="muted">Your session could not be loaded.</p>
-              <button className="button secondary" onClick={onClose}>
-                Return to your course
+              <button
+                className="button secondary"
+                onClick={() => setLoadAttempt((attempt) => attempt + 1)}
+              >
+                Retry loading
               </button>
             </>
           )}
@@ -760,6 +798,17 @@ export function StudySession({
           onRetry={retry}
           onClose={onClose}
         />
+      )}
+      {view?.paused && (
+        <div className="panel study-empty">
+          <h2>Reviews are paused</h2>
+          <p className="muted">
+            Change this course’s archive settings to resume your saved session.
+          </p>
+          <a className="button primary" href={`#/course/${view.courseId}`}>
+            Open course
+          </a>
+        </div>
       )}
       {view && !feedback && view.status !== "completed" && current && (
         <section className="panel study-card">
@@ -917,19 +966,7 @@ export function StudySession({
           )}
         </section>
       )}
-      {view && !feedback && view.status !== "completed" && !current && (
-        <div className="panel study-empty">
-          <CheckCircle2 size={32} />
-          <h2>You’re all caught up.</h2>
-          <p className="muted">
-            There are no eligible questions in this session.
-          </p>
-          <button className="button primary" onClick={onClose}>
-            Back to your course
-          </button>
-        </div>
-      )}
-      {view?.mode !== "review" && view?.status !== "completed" && (
+      {view && view.mode !== "review" && view.status !== "completed" && (
         <div className="study-note">
           <Clock3 size={15} />
           <p>

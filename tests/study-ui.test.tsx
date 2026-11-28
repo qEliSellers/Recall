@@ -1,14 +1,25 @@
 // @vitest-environment happy-dom
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { readFileSync, readdirSync } from "node:fs";
 import { createDatabase } from "../lib/sqlite";
 import { execute } from "../lib/service";
-import { rows } from "../lib/db";
+import { rows, run } from "../lib/db";
 import { handleApi } from "../worker/api";
 import { StudySession } from "../src/StudySession";
+import { MathText } from "../src/QuestionView";
+import { SessionSetup } from "../src/dialogs";
+import App from "../src/App";
+import ImportDialog from "../src/ImportDialog";
 import type { Env } from "../worker/env";
 
 let db: ReturnType<typeof createDatabase>;
@@ -78,6 +89,89 @@ afterEach(() => {
   db.close();
 });
 
+it("uploads a mixed JSON file, previews unit destinations, invalidates edits, then saves", async () => {
+  const course = await call("courses.create", {
+    name: "Synthetic import UI",
+    isMath: true,
+    units: ["First", "Second"],
+  });
+  const { units } = await call("courses.get", { id: course.id });
+  const data = JSON.stringify({
+    version: 1,
+    batchId: "test-import-ui",
+    courseId: course.id,
+    unitName: "First",
+    cards: [{ externalId: "cloze", content: cloze }],
+    problems: [
+      {
+        externalId: "fraction",
+        unitName: "Second",
+        content: { type: "typed", prompt: "One half", answer: "1/2" },
+      },
+    ],
+  });
+  const saved = vi.fn();
+  const user = userEvent.setup();
+  render(
+    <ImportDialog
+      course={course}
+      units={units}
+      kind="cards"
+      initialUnitId=""
+      onClose={() => {}}
+      onSaved={saved}
+    />,
+  );
+  await user.upload(
+    screen.getByLabelText("Import file"),
+    new File([data], "synthetic.json", { type: "application/json" }),
+  );
+  await screen.findByText("synthetic.json");
+  const check = () =>
+    user.click(screen.getByRole("button", { name: "Check batch" }));
+  await check();
+  const preview = await screen.findByRole("status", { name: "Import preview" });
+  expect(
+    within(preview).getByRole("row", { name: "First 1 0 0" }),
+  ).toBeTruthy();
+  expect(
+    within(preview).getByRole("row", { name: "Second 0 1 0" }),
+  ).toBeTruthy();
+  expect((await call("cards.list", { courseId: course.id })).total).toBe(0);
+
+  const field = screen.getByRole("textbox", { name: "Import data" });
+  fireEvent.change(field, {
+    target: {
+      value: data.replace('"unitName":"Second"', '"unitName":"Missing"'),
+    },
+  });
+  expect(screen.queryByRole("button", { name: "Import 2 items" })).toBeNull();
+  await check();
+  expect((await screen.findByRole("alert")).textContent).toMatch(
+    /Problem 1.*Missing/,
+  );
+  expect(saved).not.toHaveBeenCalled();
+
+  fireEvent.change(field, { target: { value: data } });
+  await check();
+  await user.click(
+    await screen.findByRole("button", { name: "Import 2 items" }),
+  );
+  await waitFor(() =>
+    expect(saved).toHaveBeenCalledWith(
+      expect.objectContaining({ imported: 2, skipped: 0 }),
+    ),
+  );
+  expect(
+    (await call("cards.list", { courseId: course.id, unitId: units[0].id }))
+      .items[0],
+  ).toMatchObject({ status: "unintroduced", externalId: "cloze" });
+  expect(
+    (await call("problems.list", { courseId: course.id, unitId: units[1].id }))
+      .items[0],
+  ).toMatchObject({ externalId: "fraction" });
+});
+
 async function clozeSession(mode = "review", feedback = "immediate") {
   const course = await call("courses.create", {
     name: "Synthetic UI course",
@@ -100,6 +194,194 @@ async function clozeSession(mode = "review", feedback = "immediate") {
 }
 
 describe("study interface through the shared HTTP service", () => {
+  it.each([
+    [
+      "Economics",
+      "A book costs $12 and a pen costs $3.",
+      ["A book costs $12 and a pen costs $3."],
+      0,
+    ],
+    [
+      "History",
+      "The tariff rose from US$1,200.50 to US$2,000 in 1870.",
+      ["The tariff rose from US$1,200.50 to US$2,000 in 1870."],
+      0,
+    ],
+    [
+      "French",
+      "Le billet coûte 12,50 $ ou 14 $. Traduisez « l’aller-retour ».",
+      ["Le billet coûte 12,50 $ ou 14 $. Traduisez « l’aller-retour »."],
+      0,
+    ],
+    [
+      "Physics",
+      "The apparatus costs $12. Use ($v = \\frac{d}{t}$).",
+      ["The apparatus costs $12. Use (", ")."],
+      1,
+    ],
+    [
+      "Chemistry",
+      "Mix $2 \\mathrm{mol}$ and calculate $$\nC = n/V\n$$.",
+      ["Mix ", " and calculate ", "."],
+      2,
+    ],
+    [
+      "Algebra",
+      "Write $42$ and $2x+1$ beside \\$5.",
+      ["Write ", " and ", " beside $5."],
+      2,
+    ],
+    ["日本語", "$x$に$2$を代入する。", ["に", "を代入する。"], 2],
+  ])(
+    "renders dollar amounts, equations and ordinary text in %s",
+    (_subject, text, plain, maths) => {
+      const { container } = render(<MathText text={text} />);
+      const pieces = [...container.firstElementChild!.children];
+      expect(
+        pieces.filter((p) => !p.className).map((p) => p.textContent),
+      ).toEqual(plain);
+      expect(container.querySelectorAll(".katex")).toHaveLength(maths);
+    },
+  );
+
+  it("shows the correct next action for review scopes with imported, future or suspended cards", async () => {
+    const history = await call("courses.create", {
+      name: "World History",
+      units: ["Early empires", "Modern history", "Historical methods"],
+    });
+    const { units } = await call("courses.get", { id: history.id });
+    const { ids } = await call("library.import", {
+      courseId: history.id,
+      cards: units.map((unit: any) => ({ unitId: unit.id, content: cloze })),
+    });
+    await call("courses.update", {
+      id: history.id,
+      midtermUnitId: units[0].id,
+    });
+    await call("cards.introduce", { unitId: units[0].id, count: 1 });
+    await call("cards.introduce", { unitId: units[2].id, count: 1 });
+    await run(
+      db,
+      "UPDATE schedules SET due=? WHERE card_id=?",
+      "2099-01-02T05:30:00.000Z",
+      ids[0],
+    );
+    await call("cards.status", { ids: [ids[2]], status: "suspended" });
+    const detail = await call("courses.get", { id: history.id });
+    const action = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <SessionSetup
+        {...detail}
+        onReviewAction={action}
+        onStarted={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    const start = screen.getByRole<HTMLButtonElement>("button", {
+      name: "Begin session",
+    });
+    expect(start.disabled).toBe(true);
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Study scope" }),
+      "midterm",
+    );
+    expect(screen.getByRole("status").textContent).toContain("Next review");
+    await user.click(screen.getByRole("checkbox", { name: /Review early/ }));
+    expect(start.disabled).toBe(false);
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Study scope" }),
+      "unit",
+    );
+    const unit = screen.getByRole("combobox", { name: "Unit" });
+    await user.selectOptions(unit, units[2].id);
+    expect(screen.getByRole("status").textContent).toContain("suspended");
+    expect(start.disabled).toBe(true);
+    await user.selectOptions(unit, units[1].id);
+    await user.click(screen.getByRole("button", { name: "Introduce cards" }));
+    expect(action).toHaveBeenCalledWith("introduce", [
+      expect.objectContaining({ id: units[1].id }),
+    ]);
+  });
+
+  it("advances a review after a conflicting rating and gives it a clear resume route", async () => {
+    const science = await call("courses.create", {
+      name: "Physical science",
+      units: ["Matter"],
+    });
+    const {
+      units: [unit],
+    } = await call("courses.get", { id: science.id });
+    await call("cards.import", {
+      courseId: science.id,
+      unitId: unit.id,
+      batchId: "science-ui-resume",
+      cards: ["Ice is a solid", "Steam is a gas", "Water is a liquid"].map(
+        (prompt) => ({
+          content: {
+            type: "true_false",
+            prompt,
+            options: [
+              { id: "yes", text: "True" },
+              { id: "no", text: "False" },
+            ],
+            correctOptionIds: ["yes"],
+          },
+        }),
+      ),
+    });
+    await call("cards.introduce", { unitId: unit.id, count: 3 });
+    const options = { courseId: science.id, mode: "review" };
+    const other = await call("sessions.create", { ...options, count: 1 });
+    const underway = await call("sessions.create", options);
+    const user = userEvent.setup();
+    location.hash = `#/session/${underway.id}`;
+    render(<App />);
+    await screen.findByRole("heading", { name: "Ice is a solid" });
+    const radios = screen.getAllByRole("radio");
+    radios[0].focus();
+    await user.keyboard("{ArrowRight}");
+    expect(document.activeElement).toBe(radios[1]);
+    expect(radios[1].getAttribute("aria-checked")).toBe("true");
+    await user.click(screen.getByRole("radio", { name: /True/ }));
+    await user.click(screen.getByRole("button", { name: /Check answer/ }));
+    const rating = await screen.findByRole("button", { name: /^Good/ });
+
+    const component = other.current.question.components[0];
+    await call("sessions.answer", {
+      id: other.id,
+      itemId: other.current.id,
+      response: {
+        answers: {
+          [component.id]: component.options.find(
+            (choice: any) => choice.text === "True",
+          ).id,
+        },
+      },
+    });
+    await call("sessions.rate", {
+      id: other.id,
+      itemId: other.current.id,
+      rating: 3,
+    });
+    await user.click(rating);
+    await screen.findByRole("heading", { name: "Steam is a gas" });
+    expect(screen.getByRole("status").textContent).toContain(
+      "1 unavailable question was skipped",
+    );
+
+    await user.click(screen.getByRole("radio", { name: /True/ }));
+    await user.click(screen.getByRole("button", { name: /Check answer/ }));
+    await user.click(await screen.findByRole("button", { name: /^Good/ }));
+    await screen.findByRole("heading", { name: "Water is a liquid" });
+    await user.click(screen.getByRole("button", { name: "Leave session" }));
+    const resume = await screen.findByRole("link", { name: "Resume review" });
+    expect(screen.getAllByText(/1 of 2 complete/).length).toBeGreaterThan(0);
+    await user.click(resume);
+    await screen.findByRole("heading", { name: "Water is a liquid" });
+    expect(await rows(db, "SELECT id FROM reviews")).toHaveLength(2);
+  });
+
   it("reveals and persists one blank at a time, resumes after remount, and rates the whole card once", async () => {
     const session = await clozeSession();
     const user = userEvent.setup();

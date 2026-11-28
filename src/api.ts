@@ -1,3 +1,12 @@
+export class ApiRequestError extends Error {
+  constructor(
+    public status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
 export async function api<T = any>(
   action: string,
   input: unknown = {},
@@ -9,7 +18,8 @@ export async function api<T = any>(
   });
   const result: any = await response.json().catch(() => ({}));
   if (!response.ok || result.error)
-    throw new Error(
+    throw new ApiRequestError(
+      response.status,
       typeof result.error === "string"
         ? result.error
         : result.error?.message ||
@@ -53,6 +63,7 @@ export interface Course {
   unintroducedCards?: number;
   suspendedCards?: number;
   dueCards?: number;
+  nextReviewAt?: string | null;
   unitCount?: number;
   introducedCards?: number;
   [key: string]: any;
@@ -69,8 +80,25 @@ export interface Unit {
   suspendedCards?: number;
   introducedCards?: number;
   dueCards?: number;
+  nextReviewAt?: string | null;
   [key: string]: any;
 }
+export type SessionSummary = {
+  id: string;
+  courseId: string;
+  courseName: string;
+  mode: "review" | "quiz" | "problem";
+  status: "active" | "completed";
+  answered: number;
+  total: number;
+};
+
+export const resumeLabel = (mode: SessionSummary["mode"]) =>
+  mode === "review"
+    ? "Resume review"
+    : mode === "quiz"
+      ? "Resume quiz"
+      : "Resume problem practice";
 export interface CardRow {
   id: string;
   courseId: string;

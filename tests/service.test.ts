@@ -80,6 +80,284 @@ beforeEach(() => {
   migrate(db);
 });
 afterEach(() => db.close());
+
+describe("study availability and resumable sessions", () => {
+  it("keeps suspended language cards out of new and resumed quizzes and missed-question retries", async () => {
+    const language = await call("courses.create", {
+      name: "French",
+      subject: "World Languages",
+      units: ["Greetings"],
+    });
+    const {
+      units: [unit],
+    } = await call("courses.get", { id: language.id });
+    const { ids } = await call("cards.import", {
+      courseId: language.id,
+      unitId: unit.id,
+      batchId: "language-availability",
+      cards: ["Bonjour", "Bonsoir", "Au revoir"].map((word) => ({
+        content: {
+          ...choice,
+          prompt: `Translate «${word}».`,
+          options: [
+            { id: "a", text: word },
+            { id: "b", text: "Non" },
+          ],
+        },
+      })),
+    });
+    await call("cards.introduce", { unitId: unit.id, count: 2 });
+    const quiz = {
+      courseId: language.id,
+      mode: "quiz",
+      selection: "ordered",
+      includeUnintroduced: true,
+    };
+    const earlier = await answer(
+      await call("sessions.create", { ...quiz, count: 1 }),
+      false,
+    );
+    const underway = await call("sessions.create", quiz);
+    expect(underway.current.cardId).toBe(ids[0]);
+
+    await call("cards.status", { ids: [ids[0]], status: "suspended" });
+    const fresh = await call("sessions.create", quiz);
+    expect(fresh.total).toBe(2);
+    expect(fresh.current.cardId).toBe(ids[1]);
+    expect((await answer(fresh)).current.cardId).toBe(ids[2]);
+    expect(
+      (await call("sessions.create", { ...quiz, includeUnintroduced: false }))
+        .total,
+    ).toBe(1);
+    await expect(
+      call("sessions.create", { ...quiz, retrySessionId: earlier.id }),
+    ).rejects.toThrow("No missed questions");
+
+    const advanced = await answer(underway);
+    expect(advanced).toMatchObject({
+      skipped: 1,
+      answered: 0,
+      total: 2,
+      current: { cardId: ids[1] },
+    });
+    await call("cards.status", { ids: [ids[0]], status: "active" });
+    expect(await call("sessions.get", { id: underway.id })).toMatchObject({
+      skipped: 1,
+      current: { cardId: ids[1] },
+    });
+    expect(
+      (await call("sessions.get", { id: earlier.id })).results.items[0].cardId,
+    ).toBe(ids[0]);
+    expect(await rows(db, "SELECT id FROM reviews")).toHaveLength(0);
+  });
+
+  it("resumes the remaining science reviews after a concurrent rating and reset, including after restoring a backup", async () => {
+    const science = await call("courses.create", {
+      name: "Earth Science",
+      subject: "Science",
+      units: ["The rock cycle"],
+    });
+    const {
+      units: [unit],
+    } = await call("courses.get", { id: science.id });
+    const { ids } = await call("cards.import", {
+      courseId: science.id,
+      unitId: unit.id,
+      batchId: "science-availability",
+      cards: ["Igneous", "Sedimentary", "Metamorphic"].map((rock) => ({
+        content: { ...choice, prompt: `Identify ${rock.toLowerCase()} rock.` },
+      })),
+    });
+    await call("cards.introduce", { unitId: unit.id, count: 3 });
+    const options = { courseId: science.id, mode: "review" };
+    const before = await answer(
+      await call("sessions.create", { ...options, count: 1 }),
+    );
+    let underway = await answer(await call("sessions.create", options), false);
+    expect(underway.current.cardId).toBe(ids[0]);
+    expect(
+      (await call("sessions.list", { courseId: science.id })).find(
+        (entry: any) => entry.id === underway.id,
+      ),
+    ).toMatchObject({ answered: 0, accuracy: null });
+
+    await call("sessions.rate", {
+      id: before.id,
+      itemId: before.current.id,
+      rating: 3,
+    });
+    await expect(
+      call("sessions.rate", {
+        id: underway.id,
+        itemId: underway.current.id,
+        rating: 1,
+      }),
+    ).rejects.toThrow("another session");
+    await call("cards.update", {
+      id: ids[2],
+      resetSchedule: true,
+      confirmReset: true,
+    });
+    expect((await call("dashboard")).resumeSession).toMatchObject({
+      id: underway.id,
+      answered: 0,
+      total: 1,
+    });
+    underway = await call("sessions.get", { id: underway.id });
+    expect(underway).toMatchObject({
+      skipped: 2,
+      current: { cardId: ids[1] },
+      index: 0,
+    });
+    const graded = await answer(underway);
+    const complete = await call("sessions.rate", {
+      id: graded.id,
+      itemId: graded.current.id,
+      rating: 3,
+    });
+    expect(complete).toMatchObject({
+      status: "completed",
+      skipped: 2,
+      total: 1,
+      results: { correct: 1, accuracy: 1 },
+    });
+    expect(await rows(db, "SELECT id FROM reviews")).toHaveLength(2);
+
+    const backup = await call("backup.export");
+    await call("backup.restore", { backup, confirm: true });
+    expect(await call("sessions.get", { id: graded.id })).toMatchObject({
+      status: "completed",
+      skipped: 2,
+      total: 1,
+    });
+    expect(
+      (await call("analytics", { courseId: science.id })).summary,
+    ).toMatchObject({ reviewCount: 2, reviewSuccessRate: 1 });
+  });
+
+  it("retains pending history during archive pauses and restores older backups without skip data", async () => {
+    const history = await call("courses.create", {
+      name: "World History",
+      subject: "History",
+      units: ["Sources"],
+    });
+    const {
+      units: [unit],
+    } = await call("courses.get", { id: history.id });
+    await call("cards.import", {
+      courseId: history.id,
+      unitId: unit.id,
+      batchId: "history-pause",
+      cards: [
+        {
+          content: {
+            ...choice,
+            prompt: "Which source is primary?",
+            options: [
+              { id: "a", text: "A contemporary diary" },
+              { id: "b", text: "A modern textbook" },
+            ],
+          },
+        },
+      ],
+    });
+    await call("cards.introduce", { unitId: unit.id, count: 1 });
+    const session = await answer(
+      await call("sessions.create", { courseId: history.id, mode: "review" }),
+    );
+    await call("courses.update", {
+      id: history.id,
+      archived: true,
+      archiveMode: "paused",
+    });
+    const paused = await call("sessions.get", { id: session.id });
+    expect(paused).toMatchObject({
+      paused: true,
+      status: "active",
+      answered: 0,
+    });
+    expect(paused.current).toBeUndefined();
+    expect(
+      (await call("courses.get", { id: history.id })).resumeSession,
+    ).toBeNull();
+    expect(
+      (await call("courses.get", { id: history.id })).course.nextReviewAt,
+    ).toBeNull();
+    await expect(
+      call("sessions.rate", {
+        id: session.id,
+        itemId: session.current.id,
+        rating: 3,
+      }),
+    ).rejects.toThrow("paused");
+    expect(await rows(db, "SELECT id FROM reviews")).toHaveLength(0);
+    const backup = await call("backup.export");
+    for (const item of backup.tables.session_items) delete item.skipped_at;
+    await call("backup.restore", { backup, confirm: true });
+    await call("courses.update", { id: history.id, archiveMode: "normal" });
+    expect(await call("sessions.get", { id: session.id })).toMatchObject({
+      status: "active",
+      current: { id: session.current.id, submitted: true },
+    });
+    expect((await call("dashboard")).resumeSession).toMatchObject({
+      id: session.id,
+    });
+  });
+
+  it("exposes the earliest active due time per course and unit and keeps a resumable quiz beyond recent history", async () => {
+    const course = await call("courses.create", {
+      name: "Economics",
+      subject: "Social Studies",
+      units: ["Trade", "Prices"],
+    });
+    const { units } = await call("courses.get", { id: course.id });
+    const imported = await call("library.import", {
+      courseId: course.id,
+      cards: units.map((unit: any) => ({
+        unitId: unit.id,
+        content: { ...choice, prompt: `Describe ${unit.name.toLowerCase()}.` },
+      })),
+    });
+    for (const unit of units)
+      await call("cards.introduce", { unitId: unit.id, count: 1 });
+    const future = "2099-01-02T05:30:00.000Z";
+    await run(
+      db,
+      "UPDATE schedules SET due=? WHERE card_id=?",
+      future,
+      imported.ids[1],
+    );
+    const ready = await call("courses.get", { id: course.id });
+    expect(ready.course.dueCards).toBe(1);
+    expect(ready.units[1]).toMatchObject({ dueCards: 0, nextReviewAt: future });
+    await call("cards.status", { ids: [imported.ids[0]], status: "suspended" });
+    expect((await call("courses.get", { id: course.id })).course).toMatchObject(
+      { dueCards: 0, nextReviewAt: future },
+    );
+    expect((await call("dashboard")).stats.nextReviewAt).toBe(future);
+
+    const options = { courseId: course.id, mode: "quiz", count: 1 };
+    const earlier = await call("sessions.create", options);
+    await run(
+      db,
+      "UPDATE sessions SET created_at=? WHERE id=?",
+      "2020-01-01T00:00:00.000Z",
+      earlier.id,
+    );
+    for (let i = 0; i < 9; i++)
+      await answer(await call("sessions.create", options));
+    const overview = await call("dashboard");
+    expect(
+      overview.recentSessions.some((entry: any) => entry.id === earlier.id),
+    ).toBe(false);
+    expect(overview.resumeSession).toMatchObject({
+      id: earlier.id,
+      answered: 0,
+      total: 1,
+    });
+  });
+});
+
 describe("persistent course and SRS workflows", () => {
   it("creates/reorders units, configures midterm, imports and gradually introduces without fake reviews", async () => {
     const c = await course();

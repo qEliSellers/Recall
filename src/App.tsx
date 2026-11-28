@@ -42,15 +42,26 @@ import {
   Bar,
   CartesianGrid,
 } from "recharts";
-import { api, percent, number, day, type Course, type Unit } from "./api";
+import {
+  api,
+  percent,
+  number,
+  day,
+  resumeLabel,
+  type Course,
+  type SessionSummary,
+  type Unit,
+} from "./api";
 import { Modal, Empty, Loading, ErrorNotice, Stat } from "./ui";
 import CourseDetail from "./CourseDetail";
 import { StudySession } from "./StudySession";
 import { CreateCourse, SessionSetup } from "./dialogs";
 import SettingsPage from "./SettingsPage";
 import Statistics from "./Statistics";
+import { reviewNotice, useReviewsDue } from "./review-availability";
 
 type Page = "dashboard" | "courses" | "archived" | "statistics" | "settings";
+type CourseTab = "study" | "units" | "cards";
 const navItems = [
   { id: "dashboard", label: "Overview", icon: LayoutDashboard },
   { id: "courses", label: "Courses", icon: BookOpen },
@@ -59,6 +70,8 @@ const navItems = [
 ] as const;
 function readRoute() {
   const parts = location.hash.replace(/^#\/?/, "").split("/");
+  const courseTab: CourseTab =
+    parts[2] === "units" || parts[2] === "cards" ? parts[2] : "study";
   return {
     page: ([
       "dashboard",
@@ -70,6 +83,7 @@ function readRoute() {
       ? parts[0]
       : "dashboard") as Page,
     courseId: parts[0] === "course" ? parts[1] : undefined,
+    courseTab,
     sessionId: parts[0] === "session" ? parts[1] : undefined,
   };
 }
@@ -179,6 +193,7 @@ export default function App() {
             go("/dashboard");
           }}
           onChanged={refresh}
+          onSessionChange={(id) => go(`/session/${id}`)}
         />
       </div>
     );
@@ -306,7 +321,9 @@ export default function App() {
         <div className="page-content">
           {route.courseId ? (
             <CourseDetail
+              key={route.courseId}
               id={route.courseId}
+              initialTab={route.courseTab}
               revision={revision}
               refresh={refresh}
               onSession={(id) => go(`/session/${id}`)}
@@ -351,7 +368,9 @@ export default function App() {
                   data={data}
                   onCreate={() => setCreate(true)}
                   onStudy={setSessionSetup}
-                  onCourse={(id) => go(`/course/${id}`)}
+                  onCourse={(id, tab) =>
+                    go(`/course/${id}${tab ? `/${tab}` : ""}`)
+                  }
                 />
               ) : route.page === "courses" || route.page === "archived" ? (
                 <CoursesPage
@@ -390,6 +409,12 @@ export default function App() {
       {sessionSetup && (
         <SessionSetup
           course={sessionSetup}
+          onReviewAction={(action) => {
+            setSessionSetup(null);
+            go(
+              `/course/${sessionSetup.id}/${action === "library" ? "cards" : action === "settings" ? "study" : "units"}`,
+            );
+          }}
           onClose={() => setSessionSetup(null)}
           onStarted={(id) => {
             setSessionSetup(null);
@@ -409,7 +434,7 @@ function Dashboard({
   data: any;
   onCreate: () => void;
   onStudy: (c: Course) => void;
-  onCourse: (id: string) => void;
+  onCourse: (id: string, tab?: CourseTab) => void;
 }) {
   const courses: Course[] = data?.courses || [],
     s = data?.stats || {};
@@ -418,8 +443,35 @@ function Dashboard({
   const active = s.introducedCards ?? s.activeCards ?? 0;
   const newCards = s.unintroducedCards ?? 0;
   const recent = data?.recentSessions || [];
+  const resume: SessionSummary | null = data?.resumeSession ?? null;
   const trend = data?.trend || s.workload || s.trends || data?.workload || [];
-  const nextCourse = courses.find((c) => (c.dueCards || 0) > 0) || courses[0];
+  const reviewsDue = useReviewsDue({
+    dueCards: due,
+    nextReviewAt: s.nextReviewAt,
+  });
+  const waitingCourse = courses.find((course) => course.unintroducedCards);
+  const nextCourse =
+    courses.find(
+      (course) =>
+        course.dueCards || Date.parse(course.nextReviewAt ?? "") <= Date.now(),
+    ) ??
+    waitingCourse ??
+    courses.find((course) => course.nextReviewAt === s.nextReviewAt) ??
+    courses[0];
+  const message = resume
+    ? `${resume.courseName} · ${resume.answered} of ${resume.total} complete`
+    : reviewsDue
+      ? due > 0
+        ? `${number(due)} ${due === 1 ? "card is" : "cards are"} ready to review.`
+        : "A review is ready."
+      : courses.length
+        ? reviewNotice(
+            s,
+            courses.some((course) => course.unitCount),
+            false,
+          ).message
+        : "Add a course to organize and study your material.";
+  const introduce = !resume && !reviewsDue && waitingCourse;
   return (
     <>
       <div className="dashboard-grid">
@@ -433,31 +485,45 @@ function Dashboard({
           <div className="focus-content">
             <div>
               <h2>
-                {due > 0
-                  ? "A good day to remember."
-                  : courses.length
-                    ? "Keep your momentum."
-                    : "Make room for what matters."}
+                {resume
+                  ? "Pick up where you left off."
+                  : reviewsDue
+                    ? "A good day to remember."
+                    : courses.length
+                      ? "Keep your momentum."
+                      : "Make room for what matters."}
               </h2>
-              <p>
-                {due > 0
-                  ? `${number(due)} cards are ready for a fresh look. Small sessions build lasting understanding.`
-                  : courses.length
-                    ? "Introduce new material, practice a skill, or revisit what you’ve learned."
-                    : "Bring your courses together, introduce cards at your own pace, and let science guide your reviews."}
-              </p>
-              <button
-                className="button primary"
-                onClick={() => (nextCourse ? onStudy(nextCourse) : onCreate())}
-              >
-                {nextCourse ? (
-                  <Play size={16} fill="currentColor" />
-                ) : (
-                  <Plus size={17} />
-                )}{" "}
-                {nextCourse ? "Start a study session" : "Add your first course"}
-                <ArrowRight size={17} />
-              </button>
+              <p>{message}</p>
+              <div className="button-row">
+                {resume && (
+                  <a className="button primary" href={`#/session/${resume.id}`}>
+                    <Play size={16} fill="currentColor" />{" "}
+                    {resumeLabel(resume.mode)}
+                  </a>
+                )}
+                {introduce && (
+                  <button
+                    className="button primary"
+                    onClick={() => onCourse(introduce.id, "units")}
+                  >
+                    Introduce cards
+                  </button>
+                )}
+                <button
+                  className={`button ${resume || introduce ? "secondary" : "primary"}`}
+                  onClick={() =>
+                    nextCourse ? onStudy(nextCourse) : onCreate()
+                  }
+                >
+                  {nextCourse ? (
+                    "Start a study session"
+                  ) : (
+                    <>
+                      <Plus size={17} /> Add your first course
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
             <div className="focus-art" aria-hidden="true">
               <div className="orbit orbit-one" />
@@ -685,11 +751,13 @@ function Dashboard({
                   </div>
                   <div className="activity-meta">
                     <strong>
-                      {r.accuracy == null
-                        ? r.status === "completed"
+                      {r.status === "active"
+                        ? r.answered < r.total
+                          ? `${r.answered} of ${r.total} complete`
+                          : "Open session"
+                        : r.accuracy == null
                           ? "Complete"
-                          : "In progress"
-                        : percent(r.accuracy)}
+                          : percent(r.accuracy)}
                     </strong>
                     <span>{day(r.createdAt || r.startedAt || Date.now())}</span>
                   </div>
